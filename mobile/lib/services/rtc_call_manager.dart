@@ -385,57 +385,9 @@ class RtcCallManager {
     await session.markCallActive(callId);
   }
 
-  Future<bool> startCall({
-    required String targetId,
-    String? callId,
-  }) async {
-    final myId = session.userId;
-    if (myId == null || targetId == myId) return false;
-
-    if (currentCallId != null || inCall) return false;
-
-    remoteUserId = targetId;
-
-    final suppliedCallId = callId?.trim() ?? '';
-    currentCallId = suppliedCallId.isNotEmpty
-        ? suppliedCallId
-        : const Uuid().v4();
-
-    if (currentCallId == null || currentCallId!.isEmpty) {
-      return false;
-    }
-    state = CallState.ringing;
-    caller = true;
-    inCall = false;
-    remoteOnline = null;
-    onRemoteAvailabilityChanged?.call(false);
-    await session.markCallActive(currentCallId!);
-    _pendingIceCandidates.clear();
-
-    try {
-      await session.ensureSocketReady();
-    } catch (error) {
-      await _cleanupCall(
-        reason: 'failed',
-        forceDisconnect: true,
-      );
-      return false;
-    }
-    _callStartCompleter = Completer<bool>();
-    await session.socket.sendGuaranteed({
-      'type': 'call',
-      'call_id': currentCallId,
-      'target_id': targetId,
-      'caller_name': session.displayName ?? 'Hesam',
-      'from_id': myId,
-    });
-
-    return true;
-  }
-
   Future<void> acceptCall({required String callerId, String? callId, bool userInitiated = false}) {
-    // Both custom UI and a late Core-Telecom answer callback pass through the
-    // coordinator queue.  Exactly one call_id may win beginAccept().
+    // Both custom UI and native Telecom callbacks pass through the
+    // coordinator queue. Exactly one call_id may win beginAccept().
     return CallCoordinator.instance.serialize(
       () => _acceptCall(callerId: callerId, callId: callId, userInitiated: userInitiated),
     );
@@ -459,25 +411,6 @@ class RtcCallManager {
       return;
     }
 
-    if (userInitiated) {
-      final consumed = await const MethodChannel('cn_call/call').invokeMethod<bool>(
-        'consumeCoreTelecomAnswer',
-        <String, dynamic>{'callId': acceptedCallId},
-      ) ?? false;
-      if (!consumed) {
-        throw StateError('Unable to consume Core-Telecom answer state');
-      }
-
-      try {
-        await const MethodChannel('cn_call/call').invokeMethod(
-          'startActiveCallForegroundService',
-          <String, dynamic>{'callId': acceptedCallId},
-        );
-      } catch (error) {
-        print('[CN CALL][FGS] user-initiated start unavailable call_id=$acceptedCallId error=$error');
-      }
-    }
-
     print('[CN CALL][CALL ANSWER RECEIVED] call_id=$acceptedCallId');
     await _stopRinging();
     remoteUserId = callerId;
@@ -498,6 +431,25 @@ class RtcCallManager {
       // may have arrived during the wait.
       if (await session.isCallEnded(acceptedCallId)) {
         print('[CN CALL][ACCEPT] Call already ended remotely, aborting accept call_id=$acceptedCallId');
+        return;
+      }
+
+      // Phase 5 (crossover race): ownership re-check IMMEDIATELY before
+      // call_accept. FCM may have reached the device first and become the
+      // native WS owner (reserved before addNewIncomingCall), even while the
+      // Flutter socket is still open or the session was just restored. If
+      // native owns signaling for this call now, Flutter must STOP: it sends
+      // no call_accept and never tries to seize ownership back — the accept is
+      // left to the single native path (Telecom answer). This is a live read,
+      // not the connect()-time guard; a native answer already ran nevertheless
+      // clears any stale Flutter accept attempt.
+      if (!await session.guardFlutterWsOwnership()) {
+        print('[CN CALL][ACCEPT] WS is native-owned; call_accept withheld call_id=$acceptedCallId');
+        await _cleanupCall(
+          reason: 'failed',
+          sendSignal: false,
+          forceDisconnect: true,
+        );
         return;
       }
 
@@ -577,31 +529,60 @@ class RtcCallManager {
     );
   }
 
-  /// Rehydrates only an already-active Core-Telecom call so an ongoing
-  /// notification action can use the same hangup/cleanup implementation when
-  /// the dedicated UI isolate is not the engine receiving the action.
-  Future<void> hangupForCall({
-    required String callId,
-    required String peerId,
-  }) async {
-    final id = callId.trim();
-    final peer = peerId.trim();
-    if (id.isEmpty || peer.isEmpty || await session.isCallEnded(id)) return;
-    if (currentCallId != null && currentCallId != id) return;
-    currentCallId ??= id;
-    remoteUserId ??= peer;
-    caller = false;
-    inCall = true;
-    state = CallState.connected;
-    await session.markCallActive(id);
-    await hangup();
-  }
-
   Future<void> endForSession({bool sendSignal = true}) {
     return _cleanupCall(
       reason: 'ended',
       sendSignal: sendSignal,
       signalType: 'hangup',
+      forceDisconnect: true,
+    );
+  }
+
+  /// Native-owned outgoing call reached ACTIVE (media ready). Keeps the
+  /// in-app CallScreen bound to the same native call without any Flutter
+  /// LiveKit/WebSocket of its own for that callId.
+  Future<void> onNativeCallActive() async {
+    final callId = currentCallId;
+    if (callId == null || callId.isEmpty) return;
+    _cancelCallTimeouts();
+    inCall = true;
+    state = CallState.connected;
+    print('[CN CALL][NATIVE ACTIVE] call_id=$callId');
+    onConnected?.call();
+  }
+
+  /// Native-owned call ended (event pushed by CNCallConnection after Telecom
+  /// reached setDisconnected). The terminal frame was already sent by the
+  /// native engine; Flutter only mirrors local state — one terminal path.
+  Future<void> handleNativeCallEnded(String callId) async {
+    if (!_isCurrentCall(callId)) return;
+    print('[CN CALL][NATIVE ENDED] call_id=$callId');
+    await _cleanupCall(
+      reason: 'ended',
+      sendSignal: false,
+      forceDisconnect: true,
+    );
+  }
+
+  /// App-originated outgoing: end the SAME native Telecom call (the in-app
+  /// CallScreen maps to the system connection created by placeCNCall). Never
+  /// sends a Flutter WebSocket terminal frame for it — that is the native
+  /// engine's single responsibility.
+  Future<void> endActiveNativeTelecomCall() async {
+    final callId = currentCallId;
+    if (callId != null && callId.isNotEmpty) {
+      try {
+        await const MethodChannel('cn_call/call').invokeMethod(
+          'endActiveTelecomCall',
+          <String, dynamic>{'callId': callId},
+        );
+      } catch (error) {
+        print('[CN CALL][NATIVE END FAILED] call_id=$callId error=$error');
+      }
+    }
+    await _cleanupCall(
+      reason: 'ended',
+      sendSignal: false,
       forceDisconnect: true,
     );
   }
@@ -646,42 +627,9 @@ class RtcCallManager {
 
       await livekit.disconnect();
 
-      if (callId != null && callId.isNotEmpty) {
-        final prefs = await SharedPreferences.getInstance();
-
-        await prefs.setString(
-          'cn_call_telecom_ended_call_id',
-          callId,
-        );
-
-        final activeId = prefs.getString(
-          'cn_call_telecom_active_call_id',
-        );
-
-        if (activeId == callId) {
-          await prefs.remove(
-            'cn_call_telecom_active_call_id',
-          );
-        }
-
-      }
-
       await session.markCallEnded(callId);
       await session.clearPendingIncomingCall(callId);
-      await _clearCoreTelecomAnswer(callId);
       if (callId != null) CallCoordinator.instance.markEnded(callId);
-
-      if (callId != null && callId.isNotEmpty) {
-        try {
-          await const MethodChannel('cn_call/call').invokeMethod(
-            'disconnectTelecomCall',
-            <String, dynamic>{'callId': callId, 'force': forceDisconnect},
-          );
-        } catch (_) {
-          // The normal Flutter app and non-Android platforms have no native
-          // Core-Telecom call to terminate.
-        }
-      }
 
       _pendingIceCandidates.clear();
       remoteUserId = null;
@@ -767,105 +715,7 @@ class RtcCallManager {
       throw StateError('LiveKit connected for a stale call');
     }
 
-    final prefs = await SharedPreferences.getInstance();
-
-    await prefs.setString(
-      'cn_call_telecom_active_call_id',
-      callId,
-    );
-
-    await prefs.remove(
-      'cn_call_telecom_ended_call_id',
-    );
-
-    // Core-Telecom owns the native call lifecycle.  The Flutter UI remains
-    // CN CALL's custom UI; activation merely updates the native lifecycle.
-    try {
-      await const MethodChannel('cn_call/call').invokeMethod(
-        'activateTelecomCall',
-        <String, dynamic>{'callId': callId},
-      );
-    } catch (_) {
-      // Non-Android platforms and the regular foreground engine have no
-      // Core-Telecom runtime to activate.
-    }
     livekit.notifyConnected();
-  }
-
-  Future<void> endFromTelecom({
-    required String callId,
-    required String reason,
-  }) async {
-    final id = callId.trim();
-    if (id.isEmpty) return;
-
-    /*
-     * Telecom already confirmed the terminal state before dispatching
-     * this event. Flutter must only reconcile its own signaling/media
-     * state here. It must NOT send another Telecom disconnect request.
-     */
-    await session.markCallEnded(id);
-    await session.clearPendingIncomingCall(id);
-    await _clearCoreTelecomAnswer(id);
-
-    if (!_isCurrentCall(id)) {
-      return;
-    }
-
-    if (_hangingUp) {
-      return;
-    }
-
-    _cancelCallTimeouts();
-    await _stopRinging();
-
-    try {
-      await livekit.disconnect();
-    } catch (error) {
-      print(
-        '[CN CALL][LIVEKIT] terminal disconnect failed '
-        'call_id=$id error=$error',
-      );
-    }
-
-    _pendingIceCandidates.clear();
-    remoteUserId = null;
-    currentCallId = null;
-    remoteOnline = null;
-    inCall = false;
-    caller = false;
-    _muted = false;
-    state = switch (reason) {
-      'cancelled' => CallState.cancelled,
-      'rejected' => CallState.rejected,
-      'timeout' => CallState.timeout,
-      'failed' => CallState.ended,
-      _ => CallState.ended,
-    };
-
-    onDisconnected?.call();
-
-    print(
-      '[CN CALL][CALL TERMINAL RECONCILED] '
-      'call_id=$id reason=$reason',
-    );
-  }
-
-  Future<void> _clearCoreTelecomAnswer(String? callId) async {
-    final id = callId?.trim() ?? '';
-    if (id.isEmpty) return;
-
-    try {
-      await const MethodChannel('cn_call/call').invokeMethod(
-        'clearCoreTelecomAnswer',
-        <String, dynamic>{'callId': id},
-      );
-    } catch (error) {
-      print(
-        '[CN CALL][CORE TELECOM] answer marker clear failed '
-        'call_id=$id error=$error',
-      );
-    }
   }
 
 

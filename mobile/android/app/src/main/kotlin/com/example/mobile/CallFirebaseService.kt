@@ -2,6 +2,8 @@ package com.example.mobile
 
 import org.json.JSONArray
 import org.json.JSONObject
+import android.os.Bundle
+import android.telecom.TelecomManager
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import kotlinx.coroutines.CoroutineScope
@@ -31,21 +33,9 @@ class CallFirebaseService : FirebaseMessagingService() {
 
             if (callId.isEmpty()) return
 
-            // The native service only records a terminal tombstone. Flutter
-            // reconciles signalling/media when it is active; no Telecom call
-            // exists to disconnect here.
             serviceScope.launch {
                   try {
                       markCallEnded(callId)
-                      val disconnectResult =
-                          CoreTelecomCallBridge.disconnectCallResult(callId, type)
-                      if (disconnectResult == CoreTelecomCallBridge.DisconnectResult.SUCCESS) {
-                          CoreTelecomCallBridge.finalizeTerminalCleanup(
-                              context = this@CallFirebaseService.applicationContext,
-                              callId = callId,
-                          )
-                      }
-
                       println(
                           "[CN CALL][FCM] " +
                               "FCM TERMINAL HANDLED " +
@@ -84,16 +74,58 @@ return
             return
         }
 
-        // The full-screen PendingIntent is the single durable UI handoff: it
-        // carries this exact identity into CNCallIncomingActivity.  Do not
-        // mirror it into Flutter preferences, which could belong to an older
-        // call by the time the Activity starts.
-        try {
-            CoreTelecomCallBridge.submitIncoming(this@CallFirebaseService, callId, callerId, callerName)
+        // Phase 3 (cold-start): reserve native signaling ownership NOW, before
+        // Telecom presents the call. This closes the window between FCM arrival
+        // and the user answering, during which a re-launched Flutter app could
+        // otherwise open its own WebSocket and fight for the socket. Reuses the
+        // existing shared owner marker via NativeWebSocketClient (the same API
+        // CNCallEngine uses); it refuses to seize a genuinely active/ringing
+        // Flutter call (flutterHasManagedCall), so a live Flutter call is never
+        // hijacked. No WebSocket is opened from here.
+        val acquired = NativeWebSocketClient.tryAcquireNativeOwnership(this)
+        println("[CN CALL][FCM] incoming call_id=$callId native_ws_ownership_acquired=$acquired")
 
-            println("[CN CALL][FCM] Flutter incoming launched call_id=$callId")
+        // Phase 4 (foreground): when Flutter itself is already ringing/managing
+        // THIS exact call (it reached the call first through its own WebSocket
+        // and wrote flutter.cn_call_active_call_id / pending_incoming_call),
+        // the same call must not also be presented to Telecom. Presenting it
+        // would create a second answer path (system UI) that could send its own
+        // call_accept for the same call_id — or fail the system answer because
+        // the owner marker is "flutter". Foreground stays Flutter-owned: the
+        // Telecom bridge is skipped and Flutter's accept sends call_accept once.
+        if (!acquired && isFlutterManagedSameCall(callId)) {
+            println("[CN CALL][FCM] incoming call_id=$callId already Flutter-managed; Telecom skipped")
+            return
+        }
+
+        // Phase WS-ring: a call presented to Telecom once must never be
+        // presented a second time — including the (rare) case where the WebSocket
+        // invite and the FCM invite for the SAME call_id both reach this app
+        // (Online-path WS presentation followed by an FCM copy of the same call).
+        // claimTelecomPresentation() atomically awards the slot to whichever side
+        // is first; the loser skips. The Offline/cold-start case is unaffected:
+        // no WS "call" frame exists there, so the FCM path always wins the slot.
+        if (!CNCallRegistry.claimTelecomPresentation(callId)) {
+            println("[CN CALL][FCM] incoming call_id=$callId already presented (WS); Telecom skipped")
+            return
+        }
+
+        try {
+            val telecomManager = getSystemService(TelecomManager::class.java)
+                ?: error("Telecom service is unavailable")
+            telecomManager.addNewIncomingCall(
+                CNCallPhoneAccount.handle(this),
+                Bundle().apply {
+                    putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
+                    putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
+                    putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                },
+            )
+
+            println("[CN CALL][FCM] Telecom incoming submitted call_id=$callId")
         } catch (e: Exception) {
             println("[CN CALL][FCM] incoming launch failed call_id=$callId error=$e")
+            CNCallRegistry.releaseTelecomPresentation(callId)
         }
 
         return
@@ -102,6 +134,27 @@ return
     private fun isCallEnded(callId: String): Boolean {
         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
         return endedCallIds(prefs).contains(callId)
+    }
+
+    /**
+     * True when this exact call_id is currently owned by the Flutter app:
+     * it is the active call Flutter is ringing/managing now
+     * (flutter.cn_call_active_call_id) or the call Flutter persisted as pending
+     * (flutter.pending_incoming_call). Reads the same shared file and the same
+     * fully-qualified keys the Flutter side writes; no new marker.
+     */
+    private fun isFlutterManagedSameCall(callId: String): Boolean {
+        val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+        if (prefs.getString("flutter.cn_call_active_call_id", "") == callId) return true
+        val pending = prefs.getString("flutter.pending_incoming_call", null)
+        if (!pending.isNullOrEmpty()) {
+            return try {
+                JSONObject(pending).optString("call_id") == callId
+            } catch (_: Exception) {
+                false
+            }
+        }
+        return false
     }
 
     private fun markCallEnded(callId: String) {

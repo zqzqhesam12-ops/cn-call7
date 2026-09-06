@@ -1,8 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.CALL_PHONE"/>
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
@@ -57,12 +58,20 @@
             </intent-filter>
         </service>
         <service
-            android:name=".CoreTelecomForegroundService"
+            android:name=".CNCallConnectionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+        <service
+            android:name=".CNCallAudioService"
             android:exported="false"
-            android:foregroundServiceType="phoneCall|microphone" />
-
-        <receiver android:name=".CoreTelecomActionReceiver" android:exported="false" />
-
+            android:foregroundServiceType="microphone|phoneCall" />
+        <receiver
+            android:name=".CNCallActionReceiver"
+            android:exported="false" />
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

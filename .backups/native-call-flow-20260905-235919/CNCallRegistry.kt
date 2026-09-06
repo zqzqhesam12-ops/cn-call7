@@ -1,0 +1,64 @@
+package com.example.mobile
+
+import android.telecom.Connection
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Process-local registry for native Telecom connections.
+ */
+object CNCallRegistry {
+    enum class State {
+        RINGING,
+        ANSWERING,
+        ACTIVE,
+        TERMINATED,
+    }
+
+    data class Entry(
+        val callId: String,
+        val connection: Connection,
+        val incoming: Boolean,
+        val state: AtomicReference<State> = AtomicReference(State.RINGING),
+    )
+
+    private val entries = ConcurrentHashMap<String, Entry>()
+
+    fun put(entry: Entry): Boolean {
+        return entries.putIfAbsent(entry.callId, entry) == null
+    }
+
+    fun get(callId: String): Entry? {
+        return entries[callId.trim()]
+    }
+
+    fun remove(callId: String): Entry? {
+        return entries.remove(callId.trim())
+    }
+
+    fun contains(callId: String): Boolean {
+        return entries.containsKey(callId.trim())
+    }
+
+    fun claimAnswer(callId: String): Boolean =
+        get(callId)?.state?.compareAndSet(State.RINGING, State.ANSWERING) == true
+
+    fun markActive(callId: String): Boolean =
+        get(callId)?.state?.compareAndSet(State.ANSWERING, State.ACTIVE) == true
+
+    fun claimReject(callId: String): Boolean =
+        get(callId)?.state?.compareAndSet(State.RINGING, State.TERMINATED) == true
+
+    fun claimDisconnect(callId: String): Boolean {
+        val state = get(callId)?.state ?: return false
+        while (true) {
+            val current = state.get()
+            if (current == State.TERMINATED) return false
+            if (state.compareAndSet(current, State.TERMINATED)) return true
+        }
+    }
+
+    fun markTerminated(callId: String) {
+        get(callId)?.state?.set(State.TERMINATED)
+    }
+}

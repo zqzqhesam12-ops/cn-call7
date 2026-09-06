@@ -1,8 +1,5 @@
 package com.example.mobile
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
@@ -15,9 +12,13 @@ import android.app.NotificationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.telecom.TelecomManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONObject
 
@@ -26,11 +27,44 @@ class MainActivity : FlutterActivity() {
     private var defaultRingtone: Ringtone? = null
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
+    private var pendingCallId: String? = null
+    private var pendingTargetId: String? = null
+    private var pendingCallResult: MethodChannel.Result? = null
     companion object {
         const val ACTION_INCOMING_CALL = "com.example.mobile.action.INCOMING_CALL"
         private const val EVENTS_CHANNEL = "cn_call/telecom_events"
         private const val PREFERENCES = "FlutterSharedPreferences"
         private const val PENDING_CALL_KEY = "flutter.pending_incoming_call"
+        private const val REQUEST_CALL_PHONE = 9301
+
+        /**
+         * The Flutter Engine messenger of the running MainActivity, when the
+         * app UI is alive. Used by CNCallConnection to push "active"/"ended"
+         * events so the in-app CallScreen tracks the same native call. Best
+         * effort: no messenger (system Dialer path / cold start) → no push.
+         */
+        @Volatile
+        private var flutterMessenger: BinaryMessenger? = null
+
+        fun attachFlutterMessenger(messenger: BinaryMessenger) {
+            flutterMessenger = messenger
+        }
+
+        fun detachFlutterMessenger() {
+            flutterMessenger = null
+        }
+
+        fun postTelecomEvent(method: String, arguments: Map<String, Any?>) {
+            val messenger = flutterMessenger ?: return
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    MethodChannel(messenger, EVENTS_CHANNEL)
+                        .invokeMethod(method, arguments)
+                } catch (_: Exception) {
+                    // Flutter may be mid-teardown; events are best-effort only.
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -57,44 +91,152 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        // Keep Core Telecom available strictly as a lifecycle/event bridge.
-        // It never owns CN CALL's visual interface.
-        CoreTelecomManager.register(this)
+        attachFlutterMessenger(flutterEngine.dartExecutor.binaryMessenger)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cn_call/call")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "coreTelecomFlutterReady" -> {
-                        CoreTelecomFlutterDispatcher.markFlutterReady(this, flutterEngine)
-                        result.success(true)
+                    "placeCNCall" -> {
+                        val callId = call.argument<String>("callId")?.trim().orEmpty()
+                        val targetId = call.argument<String>("targetId")?.trim().orEmpty()
+
+                        if (callId.isEmpty() || targetId.isEmpty()) {
+                            result.error(
+                                "missing_call_identity",
+                                "placeCNCall requires callId and targetId",
+                                null,
+                            )
+                            return@setMethodCallHandler
+                        }
+
+                        try {
+                            val telecomManager =
+                                getSystemService(android.telecom.TelecomManager::class.java)
+
+                            if (telecomManager == null) {
+                                result.error(
+                                    "telecom_unavailable",
+                                    "Telecom service is unavailable",
+                                    null,
+                                )
+                                return@setMethodCallHandler
+                            }
+
+                            if (!CNCallPhoneAccount.isEnabled(this)) {
+                                result.error(
+                                    "phone_account_disabled",
+                                    "CN CALL PhoneAccount is not enabled",
+                                    null,
+                                )
+                                return@setMethodCallHandler
+                            }
+
+                            if (!hasCallPermission()) {
+                                // First in-app call: ask for the runtime
+                                // permission the official way. The TRUE
+                                // placeCall is only attempted once granted;
+                                // "don't send the call before the permission".
+                                if (pendingCallResult != null) {
+                                    result.error(
+                                        "request_in_progress",
+                                        "A call permission request is already pending",
+                                        null,
+                                    )
+                                    return@setMethodCallHandler
+                                }
+                                pendingCallId = callId
+                                pendingTargetId = targetId
+                                pendingCallResult = result
+                                requestPermissions(
+                                    arrayOf(
+                                        android.Manifest.permission.CALL_PHONE,
+                                        android.Manifest.permission.READ_PHONE_NUMBERS,
+                                    ),
+                                    REQUEST_CALL_PHONE,
+                                )
+                                return@setMethodCallHandler
+                            }
+
+                            placeCNCallWithTelecom(callId, targetId, result)
+                        } catch (error: SecurityException) {
+                            result.error(
+                                "telecom_security",
+                                "Telecom rejected outgoing CN CALL",
+                                error.message,
+                            )
+                        } catch (error: Exception) {
+                            result.error(
+                                "telecom_place_call_failed",
+                                "Failed to place outgoing CN CALL",
+                                error.message,
+                            )
+                        }
                     }
-                    "claimCoreTelecomAnswer" -> result.success(
-                        CoreTelecomCallBridge.claimAnswerForUi(
-                            this,
-                            call.argument<String>("callId").orEmpty(),
-                        ),
-                    )
-                    "disconnectTelecomCall" -> CoroutineScope(Dispatchers.Default).launch {
-                        val callId = call.argument<String>("callId").orEmpty()
-                        val force = call.argument<Boolean>("force") ?: false
-                        result.success(CoreTelecomCallBridge.disconnectCall(callId, "ended", force))
+
+                    "registerCNCallPhoneAccount" -> {
+                        try {
+                            CNCallPhoneAccount.register(this)
+                            result.success(true)
+                        } catch (error: SecurityException) {
+                            result.error(
+                                "phone_account_security",
+                                "Telecom rejected CN CALL account registration",
+                                error.message,
+                            )
+                        } catch (error: IllegalArgumentException) {
+                            result.error(
+                                "phone_account_invalid",
+                                "CN CALL phone account is invalid",
+                                error.message,
+                            )
+                        }
                     }
-                    "hasNativeRuntime" -> result.success(
-                        CoreTelecomCallBridge.hasNativeRuntime(
-                            call.argument<String>("callId").orEmpty(),
-                        ),
-                    )
-                    "consumeCoreTelecomAnswer" -> result.success(
-                        CoreTelecomCallBridge.consumeAnswerRequested(
-                            this,
-                            call.argument<String>("callId").orEmpty(),
-                        ),
-                    )
-                    "clearCoreTelecomAnswer" -> result.success(
-                        CoreTelecomCallBridge.clearAnswerRequested(
-                            this,
-                            call.argument<String>("callId").orEmpty(),
-                        ),
-                    )
+                    "isCNCallPhoneAccountEnabled" -> {
+                        try {
+                            result.success(CNCallPhoneAccount.isEnabled(this))
+                        } catch (error: IllegalStateException) {
+                            result.error(
+                                "telecom_unavailable",
+                                "Telecom service is unavailable",
+                                error.message,
+                            )
+                        }
+                    }
+                    "hasReadPhoneNumbersPermission" -> {
+                        result.success(
+                            Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                                checkSelfPermission(
+                                    android.Manifest.permission.READ_PHONE_NUMBERS,
+                                ) == PackageManager.PERMISSION_GRANTED,
+                        )
+                    }
+                    "openAppSettings" -> {
+                        try {
+                            startActivity(
+                                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                    data = Uri.fromParts("package", packageName, null)
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                },
+                            )
+                            result.success(true)
+                        } catch (_: ActivityNotFoundException) {
+                            result.success(false)
+                        }
+                    }
+                    "openTelecomCallSettings" -> {
+                        // Shows the system "Calling accounts" screen where the
+                        // user toggles the CN CALL PhoneAccount on/off.
+                        val target = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            Intent(TelecomManager.ACTION_SHOW_CALL_SETTINGS)
+                        } else {
+                            Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+                        }
+                        try {
+                            startActivity(target)
+                            result.success(true)
+                        } catch (_: ActivityNotFoundException) {
+                            result.success(false)
+                        }
+                    }
                     "canUseFullScreenIntent" -> {
                         result.success(
                             Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
@@ -118,7 +260,6 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                     }
-                    "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
                     "configureCallAudio" -> {
                         stopDefaultRingtone()
                         releaseActivityAudioFocus()
@@ -136,9 +277,101 @@ class MainActivity : FlutterActivity() {
                         stopDefaultRingtone()
                         result.success(true)
                     }
+                    "endActiveTelecomCall" -> {
+                        // App-originated outgoing: the in-app CallScreen ends the
+                        // native Telecom call through its Connection (the SINGLE
+                        // terminal path — CNCallConnection.onDisconnect →
+                        // CNCallEngine.disconnect sends the terminal frame once;
+                        // Flutter sends no hangup for this call).
+                        val callId = call.argument<String>("callId")?.trim().orEmpty()
+                        val entry = if (callId.isEmpty()) {
+                            null
+                        } else {
+                            CNCallRegistry.get(callId)
+                        }
+                        if (entry == null) {
+                            result.success(false)
+                        } else {
+                            entry.connection.onDisconnect()
+                            result.success(true)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun hasCallPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
+                PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun placeCNCallWithTelecom(
+        callId: String,
+        targetId: String,
+        result: MethodChannel.Result,
+    ) {
+        try {
+            val telecomManager =
+                getSystemService(android.telecom.TelecomManager::class.java)
+                    ?: run {
+                        result.error(
+                            "telecom_unavailable",
+                            "Telecom service is unavailable",
+                            null,
+                        )
+                        return
+                    }
+            val address = Uri.parse("cncall:$targetId")
+            val extras = Bundle().apply {
+                putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
+            }
+            telecomManager.placeCall(address, extras)
+            result.success(true)
+        } catch (error: SecurityException) {
+            result.error(
+                "telecom_security",
+                "Telecom rejected outgoing CN CALL",
+                error.message,
+            )
+        } catch (error: Exception) {
+            result.error(
+                "telecom_place_call_failed",
+                "Failed to place outgoing CN CALL",
+                error.message,
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_CALL_PHONE) return
+
+        val callId = pendingCallId
+        val targetId = pendingTargetId
+        val result = pendingCallResult
+        pendingCallId = null
+        pendingTargetId = null
+        pendingCallResult = null
+
+        if (callId == null || targetId == null || result == null) return
+
+        if (grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        ) {
+            placeCNCallWithTelecom(callId, targetId, result)
+        } else {
+            result.error(
+                "permission_denied",
+                "CALL_PHONE permission is required to place in-app calls",
+                null,
+            )
+        }
     }
 
     private fun configureCallAudio(speaker: Boolean) {
@@ -190,6 +423,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        detachFlutterMessenger()
         stopDefaultRingtone()
         audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         audioManager?.mode = AudioManager.MODE_NORMAL

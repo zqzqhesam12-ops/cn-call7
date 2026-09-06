@@ -1,0 +1,41 @@
+ M mobile/android/app/build.gradle.kts
+ M mobile/android/app/src/main/AndroidManifest.xml
+ D mobile/android/app/src/main/kotlin/com/example/mobile/BackgroundFlutterEngine.kt
+ M mobile/android/app/src/main/kotlin/com/example/mobile/CNCallIncomingActivity.kt
+ M mobile/android/app/src/main/kotlin/com/example/mobile/CallFirebaseService.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomActionReceiver.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallBridge.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallRegistry.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallRegistryTest.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomFlutterDispatcher.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomForegroundService.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomManager.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomNotification.kt
+ M mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt
+ D mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt.bak.20260904-132039
+ M mobile/lib/main.dart
+ M mobile/lib/services/call_session.dart
+ M mobile/lib/services/rtc_call_manager.dart
+ D mobile/lib/services/rtc_call_manager.dart.before-ring-flags
+?? .backups/
+?? .continue/
+?? .gitignore
+?? mobile/android/app/build.gradle.kts.bak.phase15-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallActionReceiver.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallAudioService.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallConnection.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallConnectionService.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallEngine.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallEngine.kt.bak.phase1-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallEngine.kt.bak.phase16-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallEngine.kt.bak.phase17-20260906
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallNotification.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallPhoneAccount.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/CNCallRegistry.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeCallTokenHelper.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeCallTokenHelper.kt.bak.phase15c-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeLiveKit.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeLiveKit.kt.bak.phase15d-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeWebSocketClient.kt
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeWebSocketClient.kt.bak.phase15b-20260905
+?? mobile/android/app/src/main/kotlin/com/example/mobile/NativeWebSocketClient.kt.bak.phase15b-review-20260905

@@ -1,0 +1,69 @@
+package com.example.mobile
+
+import android.content.Context
+
+/**
+ * Native credentials + LiveKit token helper for CN CALL.
+ *
+ * PHASE 1: INACTIVE. This defines the future native path for reading the CN
+ * CALL session identity and fetching a LiveKit token. It performs no network
+ * I/O and touches no storage in Phase 1.
+ *
+ * Future contract (mirrors the current Dart path):
+ *   - Credentials are read from SharedPreferences under the exact keys the
+ *     Flutter `shared_preferences` plugin writes (with the flutter. prefix),
+ *     i.e. "flutter.cn_call_user_id", "flutter.cn_call_access_token",
+ *     "flutter.cn_call_display_name".
+ *   - LiveKit token: GET <httpUrl>/livekit/token?user_id=&call_id= with
+ *     "Authorization: Bearer <accessToken>". Server validates the call is in
+ *     {accepted, negotiating, connected} and that the caller is a participant
+ *     (server/main.py /livekit/token).
+ */
+object NativeCallTokenHelper {
+
+    /** Result of a future LiveKit token fetch. */
+    data class LiveKitTokenResult(
+        val url: String,
+        val token: String,
+        val room: String,
+    )
+
+    /**
+     * Reads the stored CN CALL access token, if present.
+     *
+     * PHASE 1: no-op returning null (never triggers storage/network).
+     */
+    fun restoreAccessToken(context: Context): String? {
+        // Intentionally does nothing in Phase 1.
+        register(context)
+        return null
+    }
+
+    /**
+     * Reads the stored CN CALL user id, if present.
+     *
+     * PHASE 1: no-op returning null.
+     */
+    fun restoreUserId(context: Context): String? {
+        // Intentionally does nothing in Phase 1.
+        return null
+    }
+
+    /**
+     * Future LiveKit token fetch. PHASE 1: no-op returning null.
+     */
+    fun fetchLiveKitToken(
+        context: Context,
+        userId: String,
+        callId: String,
+    ): LiveKitTokenResult? {
+        // Intentionally does nothing in Phase 1.
+        @Suppress("UNUSED_VARIABLE")
+        val target = callId
+        return null
+    }
+
+    private fun register(context: Context) {
+        // Reserved for future preference-resource registration.
+    }
+}

@@ -49,6 +49,42 @@ access_tokens: dict[str, str] = {}
 user_access_tokens: dict[str, str] = {}
 call_expiry_task: asyncio.Task | None = None
 
+# Once the media leg is usable (status "connected") the signaling socket may
+# legitimately drop (network blip, app backgrounded) without ending the call,
+# and the terminal frame may then never arrive. That used to pin the caller
+# AND the target in `active_call_users` forever, so every later attempt was
+# rejected early with "duplicate_or_busy" before `call_started`. This is the
+# connected-idle grace: while BOTH sockets are alive the deadline keeps being
+# extended (a real conversation is never auto-cut); if one side's socket stays
+# gone, the call is released after this window and both users are freed.
+CONNECTED_IDLE_TIMEOUT_MS = 60_000
+
+
+def _mark_active_user(user_id: str, call_id: str, role: str) -> None:
+    active_call_users[user_id] = call_id
+    print(
+        "[CN CALL][ACTIVE_USERS] add role=",
+        role,
+        "user=",
+        user_id,
+        "call=",
+        call_id,
+    )
+
+
+def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
+    if active_call_users.get(user_id) != call_id:
+        return
+    active_call_users.pop(user_id, None)
+    print(
+        "[CN CALL][ACTIVE_USERS] remove user=",
+        user_id,
+        "call=",
+        call_id,
+        "reason=",
+        reason,
+    )
+
 
 def release_call(call_id: str, reason: str) -> bool:
     record = active_calls.pop(call_id, None)
@@ -57,8 +93,8 @@ def release_call(call_id: str, reason: str) -> bool:
 
     caller_id = str(record["caller_id"])
     target_id = str(record["target_id"])
-    active_call_users.pop(caller_id, None)
-    active_call_users.pop(target_id, None)
+    _unmark_active_user(caller_id, call_id, reason)
+    _unmark_active_user(target_id, call_id, reason)
 
     status = reason
     if reason == "timeout":
@@ -156,22 +192,53 @@ async def release_calls_for_user(user_id: str, token: str | None = None):
 
 async def expire_active_calls():
     now = int(time.time() * 1000)
-    expired_ids = {
-        call_id
-        for call_id, record in active_calls.items()
-        if (
-            record["status"] == "ringing"
-            and int(record["ring_expires_at"]) <= now
-        ) or (
-            record["status"] == "accepted"
-            and record["negotiation_expires_at"] is not None
-            and int(record["negotiation_expires_at"]) <= now
-        ) or (
-            record["status"] == "negotiating"
-            and record["connection_expires_at"] is not None
-            and int(record["connection_expires_at"]) <= now
-        )
-    }
+    expired_ids = set()
+
+    for call_id, record in active_calls.items():
+        status = str(record["status"])
+
+        if status == "ringing":
+            if int(record["ring_expires_at"]) <= now:
+                expired_ids.add(call_id)
+            continue
+
+        if status == "accepted":
+            if (
+                record["negotiation_expires_at"] is not None
+                and int(record["negotiation_expires_at"]) <= now
+            ):
+                expired_ids.add(call_id)
+            continue
+
+        if status == "negotiating":
+            if (
+                record["connection_expires_at"] is not None
+                and int(record["connection_expires_at"]) <= now
+            ):
+                expired_ids.add(call_id)
+            continue
+
+        if status == "connected":
+            caller_id = str(record["caller_id"])
+            target_id = str(record["target_id"])
+            both_online = (
+                caller_id in connections
+                and target_id in connections
+            )
+            if both_online:
+                # Both endpoints are still reachable: keep the call alive by
+                # re-arming the idle deadline every sweep. Only a genuinely
+                # missing party lets the countdown reach release.
+                record["connection_expires_at"] = (
+                    now + CONNECTED_IDLE_TIMEOUT_MS
+                )
+                continue
+            if (
+                record["connection_expires_at"] is not None
+                and int(record["connection_expires_at"]) <= now
+            ):
+                expired_ids.add(call_id)
+            continue
 
     for call_id in expired_ids:
         record = active_calls.get(call_id)
@@ -1063,8 +1130,8 @@ async def websocket_endpoint(
                     "target_token": user_access_tokens.get(target_id),
                     "media_ready_users": set(),
                 }
-                active_call_users[user_id] = call_id
-                active_call_users[target_id] = call_id
+                _mark_active_user(user_id, call_id, "caller")
+                _mark_active_user(target_id, call_id, "callee")
 
                 await websocket.send_json({
                     "type": "call_started",
@@ -1197,11 +1264,22 @@ async def websocket_endpoint(
                     ready_users.add(user_id)
                     if {caller_id, receiver_id}.issubset(ready_users):
                         record["status"] = "connected"
-                        record["connection_expires_at"] = None
+                        record["connection_expires_at"] = (
+                            int(time.time() * 1000)
+                            + CONNECTED_IDLE_TIMEOUT_MS
+                        )
                     else:
                         # One endpoint has local media, but the call is not
                         # connected until both have reported a usable path.
                         record["status"] = "negotiating"
+            # Any valid frame that touches a connected call is activity: it
+            # re-arms the connected-idle deadline instead of counting toward
+            # it, so an active conversation is never auto-cut.
+            if str(record["status"]) == "connected":
+                record["connection_expires_at"] = (
+                    int(time.time() * 1000)
+                    + CONNECTED_IDLE_TIMEOUT_MS
+                )
             forwarded = {
                 **message,
                 "call_id": call_id,

@@ -1,0 +1,503 @@
+package com.example.mobile
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+
+/**
+ * CN CALL native call-engine boundary.
+ *
+ * PHASE 1.6: the orchestration layer for the three native components:
+ *   - NativeWebSocketClient → signaling transport
+ *   - NativeCallTokenHelper  → credentials + LiveKit token
+ *   - NativeLiveKit          → media transport
+ *
+ * The engine now OWNS and primes the components, but does NOT activate them
+ * against live calls yet: the Flutter/Dart call path (CallSocket.dart +
+ * livekit_call.dart) keeps working unchanged, CNCallConnection /
+ * CNCallConnectionService are untouched, no WebSocket is auto-started and no
+ * LiveKit room is auto-joined.
+ *
+ * Ownership split (architecture report):
+ *   - CNCallEngine → orchestrates signaling + media transport only.
+ *   - CNCallConnection → Telecom lifecycle only (state transitions + audio).
+ *   - Audio focus/routing/microphone lifecycle → owned by Android Telecom.
+ *   The engine must NEVER acquire audio focus, set MODE_IN_COMMUNICATION, or
+ *   call setSpeakerphoneOn for call audio.
+ *
+ * Phase 1.6 activation contract:
+ *   - initialize(context, callbacks) records the applicationContext, primes
+ *     NativeLiveKit.initialize(...) and registers the engine's WebSocket
+ *     listener exactly once. It does NOT connect anything automatically.
+ *   - Incoming signaling frames (call_started / call_accept / call_reject /
+ *     call_cancelled / hangup / timeout / signaling_rejected /
+ *     session_invalid) are translated into INTERNAL engine events/state only:
+ *     no Telecom action, no Flutter UI, no LiveKit connect.
+ *   - connectSignaling() / connectLiveKit() are internal helpers reserved for
+ *     the activation phase. call_started does NOT auto-trigger them.
+ *   - onCallStarted / onCallConnected / onCallEnded are lifecycle hooks bound
+ *     to the current generation. onCallEnded tears down NativeLiveKit (media
+ *     only) — it never sends a signaling hangup; a real hangup travels
+ *     exclusively through the WebSocket layer.
+ */
+object CNCallEngine {
+
+    /**
+     * Engine runtime state. Phase 1.6 keeps the placeholder delegate
+     * not-ready (no socket or room is created), so the Flutter path stays.
+     */
+    enum class State {
+        UNINITIALIZED,
+        INITIALIZED,
+        COMPONENTS_READY,
+        IN_CALL,
+        TERMINATED,
+    }
+
+    /**
+     * Callbacks surfaced up to the Telecom layer (CNCallConnection).
+     * These are the single channel that translates media/signaling progress
+     * into Connection state.
+     */
+    interface Callbacks {
+        fun onMediaReady()
+        fun onDisconnected()
+        fun onError(message: String)
+    }
+
+    /**
+     * The native signaling + media operations. CNCallEngineImpl will provide
+     * the real implementation (NativeWebSocketClient + NativeLiveKit) in a
+     * later phase.
+     */
+    interface Delegate {
+        fun initialize(context: Context, callbacks: Callbacks): Boolean
+        fun startIncoming(callId: String, callerId: String, callerName: String): Boolean
+        fun startOutgoing(callId: String, address: String): Boolean
+        fun answer(callId: String): Boolean
+        fun reject(callId: String): Boolean
+        fun disconnect(callId: String): Boolean
+        fun hold(callId: String): Boolean
+        fun unhold(callId: String): Boolean
+        fun setMute(callId: String, muted: Boolean): Boolean
+        fun setSpeaker(callId: String, speaker: Boolean): Boolean
+        fun release(callId: String): Boolean
+    }
+
+    /**
+     * Future native engine implementation. PHASE 1.6: interface placeholder
+     * still (kept intentionally inactive so the Flutter call path is
+     * untouched). In later phases this will orchestrate NativeWebSocketClient
+     * and NativeLiveKit directly.
+     */
+    class CNCallEngineImpl : Delegate {
+        override fun initialize(context: Context, callbacks: Callbacks): Boolean {
+            // Not activated in Phase 1.6.
+            @Suppress("UNUSED_VARIABLE")
+            val ctx = context
+            return false
+        }
+
+        override fun startIncoming(callId: String, callerId: String, callerName: String): Boolean =
+            false
+
+        override fun startOutgoing(callId: String, address: String): Boolean = false
+
+        override fun answer(callId: String): Boolean = false
+
+        override fun reject(callId: String): Boolean = false
+
+        override fun disconnect(callId: String): Boolean = false
+
+        override fun hold(callId: String): Boolean = false
+
+        override fun unhold(callId: String): Boolean = false
+
+        override fun setMute(callId: String, muted: Boolean): Boolean = false
+
+        override fun setSpeaker(callId: String, speaker: Boolean): Boolean = false
+
+        override fun release(callId: String): Boolean = false
+    }
+
+    /** Real delegate. Phase 1.6 installs the placeholder engine, still inactive. */
+    private var delegate: Delegate? = null
+
+    /** Engine lifecycle state. */
+    @Volatile
+    var state: State = State.UNINITIALIZED
+        private set
+
+    @Volatile
+    private var callbacks: Callbacks? = null
+
+    /** Working Context recorded on initialize (used by token helpers). */
+    @Volatile
+    private var appContext: Context? = null
+
+    // ------------------------------------------------------------
+    // Phase 1.6: native orchestration state
+    // ------------------------------------------------------------
+
+    private val lock = Any()
+
+    /**
+     * Engine epoch. Bumped whenever the engine scores or clears a call so a
+     * stale signaling frame/hook from an older call can never mutate the state
+     * of a newer one (mirrors the generation guards inside NativeWebSocketClient
+     * and NativeLiveKit).
+     */
+    @Volatile
+    private var generation = 0L
+
+    /** The call the engine is currently scored to (activation phase). */
+    @Volatile
+    private var scoredCallId: String? = null
+
+    /** Most recent incoming-call signal, recorded internally, never surfaced. */
+    @Volatile
+    private var pendingIncomingCall: PendingIncomingCall? = null
+
+    /** Call whose callee answered (call_accept); media not auto-started. */
+    @Volatile
+    private var acceptedCallId: String? = null
+
+    /** False after {"type":"session_invalid"}: signaling transport disabled. */
+    @Volatile
+    private var sessionTokenValid = true
+
+    /** Last WebSocket transport error, for diagnostics only. */
+    @Volatile
+    private var lastSignalingError: Throwable? = null
+
+    /** True once the engine's WebSocket listener has been registered. */
+    @Volatile
+    private var wsListenerRegistered = false
+
+    private data class PendingIncomingCall(
+        val callId: String,
+        val callerId: String,
+        val callerName: String,
+    )
+
+    /** Single bridge from NativeWebSocketClient into internal engine state. */
+    private val webSocketListener = object : NativeWebSocketListener {
+        override fun onFrame(type: String, payload: Map<String, String>) {
+            handleSignalingFrame(type, payload)
+        }
+
+        override fun onClosed(code: Int, reason: String) {
+            // Transport-only: NativeWebSocketClient owns the reconnect policy.
+            // Socket closure is NOT call termination, so the engine does not
+            // map it to any call state.
+        }
+
+        override fun onError(t: Throwable) {
+            lastSignalingError = t
+        }
+    }
+
+    /**
+     * Installs the native engine and records the working Context for the
+     * native path. PHASE 1.6: idempotent (already-initialized is a success);
+     * the placeholder delegate still reports not-ready rather than claiming
+     * media. Performs no I/O and no connection — it only primes the three
+     * native components.
+     */
+    fun initialize(context: Context, callbacks: Callbacks): Boolean {
+        if (!hasRecordAudioPermission(context)) {
+            return unavailable(
+                "initialize",
+                "",
+                callbacks,
+                "RECORD_AUDIO permission is not granted",
+            )
+        }
+        this.callbacks = callbacks
+        this.appContext = context.applicationContext
+        if (delegate == null) {
+            delegate = CNCallEngineImpl()
+        }
+        if (state == State.UNINITIALIZED) {
+            state = State.INITIALIZED
+        } else if (state == State.TERMINATED) {
+            // Re-usable after a full teardown.
+            state = State.INITIALIZED
+        }
+        // Phase 1.6: prime the native components. Nothing connects here.
+        NativeLiveKit.initialize(context.applicationContext)
+        registerWebSocketListenerOnce()
+        val ready = delegate?.initialize(context, callbacks) == true
+        if (ready) {
+            state = State.COMPONENTS_READY
+            registerFutureComponents()
+        }
+        return ready
+    }
+
+    fun hasRecordAudioPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun isReady(): Boolean = state == State.COMPONENTS_READY && delegate != null
+
+    fun startIncoming(
+        callId: String,
+        callerId: String,
+        callerName: String,
+    ): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun startOutgoing(callId: String, address: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun answer(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun reject(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun disconnect(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun setMute(callId: String, muted: Boolean): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun setSpeaker(callId: String, speaker: Boolean): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun hold(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun unhold(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun release(callId: String): Boolean {
+        // Phase 1.6: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    // ------------------------------------------------------------
+    // Lifecycle hooks (Phase 1.6: generation-guarded, native teardown only)
+    // ------------------------------------------------------------
+
+    /**
+     * Scores a new call into the engine: starts a fresh epoch so stale frames
+     * from any previous call lose their guard. Does NOT start media or signal.
+     */
+    fun onCallStarted(callId: String) {
+        synchronized(lock) {
+            ++generation
+            scoredCallId = callId
+        }
+        if (state == State.INITIALIZED || state == State.COMPONENTS_READY) {
+            state = State.IN_CALL
+        }
+    }
+
+    /**
+     * Marks the scored call as media-connected. In the activation phase the
+     * local microphone will be requested here via
+     * NativeLiveKit.setMicrophoneEnabled(true); LiveKit is never
+     * auto-connected from signaling in Phase 1.6, so the mic stays off.
+     */
+    fun onCallConnected(callId: String) {
+        synchronized(lock) {
+            if (callId != scoredCallId) return
+            // Reserved: enable the local mic through NativeLiveKit once the
+            // engine actually drives media (later phase).
+        }
+    }
+
+    /**
+     * Tears down the engine's media transport for the scored call.
+     *
+     * Only NativeLiveKit.disconnect() is invoked (leaves + releases the room,
+     * never sends a signaling hangup). Signaling hangup is delivered
+     * exclusively by the WebSocket layer when a real hangup frame arrives.
+     * The WebSocket transport itself is session-scoped and stays connected so
+     * the user can receive further signals; explicitly NOT torn down here.
+     */
+    fun onCallEnded(reason: String) {
+        NativeLiveKit.disconnect()
+        synchronized(lock) {
+            ++generation
+            scoredCallId = null
+            pendingIncomingCall = null
+            acceptedCallId = null
+        }
+        state = State.TERMINATED
+    }
+
+    // ------------------------------------------------------------
+    // Phase 1.6: internal orchestration (not activated)
+    // ------------------------------------------------------------
+
+    /**
+     * Registers the engine's signaling bridge exactly once. Repeated calls are
+     * no-ops, so re-initialization never registers a second listener.
+     */
+    private fun registerWebSocketListenerOnce() {
+        synchronized(lock) {
+            if (!wsListenerRegistered) {
+                NativeWebSocketClient.addListener(webSocketListener)
+                wsListenerRegistered = true
+            }
+        }
+    }
+
+    /**
+     * Restores the session credentials once (NativeCallTokenHelper.restoreUserId
+     * / restoreAccessToken) and opens the authenticated WebSocket.
+     *
+     * NOT called automatically: reserved for the activation phase, so the
+     * Flutter signaling path keeps full control of the current session.
+     */
+    private fun connectSignaling(): Boolean {
+        val context = appContext ?: return false
+        val userId = NativeCallTokenHelper.restoreUserId(context) ?: return false
+        val token = NativeCallTokenHelper.restoreAccessToken(context) ?: return false
+        if (userId.isBlank() || token.isBlank()) return false
+        return NativeWebSocketClient.connect(userId.trim(), token.trim())
+    }
+
+    /**
+     * Fetches a LiveKit token for [callId] (NativeCallTokenHelper) and joins
+     * the room through NativeLiveKit.
+     *
+     * NOT invoked from call_started or any signaling frame: reserved for the
+     * activation phase (Flutter still owns media until then).
+     */
+    private fun connectLiveKit(callId: String): Boolean {
+        val context = appContext ?: return false
+        val userId = NativeCallTokenHelper.restoreUserId(context) ?: return false
+        val result = NativeCallTokenHelper.fetchLiveKitToken(context, userId, callId)
+            ?: return false
+        return NativeLiveKit.connect(result.url, result.token, callId)
+    }
+
+    /**
+     * Translates an incoming signaling frame into INTERNAL engine events/state
+     * only. No Telecom action, no Flutter UI and no LiveKit connect happen
+     * here in Phase 1.6. Frames referring to a call other than the current
+     * epoch's are treated as stale and ignored.
+     */
+    private fun handleSignalingFrame(type: String, payload: Map<String, String>) {
+        val frameCallId = payload["call_id"].orEmpty()
+        when (type) {
+            "call_started" -> {
+                val callerId = (payload["from_id"] ?: payload["caller_id"]).orEmpty()
+                val callerName = (payload["caller_name"] ?: callerId).orEmpty()
+                synchronized(lock) {
+                    // New signaling epoch invalidates any stale pending state.
+                    ++generation
+                    pendingIncomingCall =
+                        PendingIncomingCall(frameCallId, callerId, callerName)
+                }
+                println(
+                    "[CN CALL][ENGINE] signaling call_started call_id=$frameCallId" +
+                        " caller_id=$callerId",
+                )
+            }
+
+            "call_accept" -> {
+                synchronized(lock) {
+                    val matches =
+                        frameCallId.isNotEmpty() &&
+                            (frameCallId == scoredCallId ||
+                                frameCallId == pendingIncomingCall?.callId)
+                    if (matches) {
+                        acceptedCallId = frameCallId
+                        println(
+                            "[CN CALL][ENGINE] signaling call_accept call_id=$frameCallId",
+                        )
+                    } else {
+                        println(
+                            "[CN CALL][ENGINE] signaling call_accept stale call_id=$frameCallId",
+                        )
+                    }
+                }
+            }
+
+            "call_reject", "call_cancelled", "hangup", "timeout", "signaling_rejected" ->
+                clearScoredCall(frameCallId, type)
+
+            "session_invalid" -> {
+                sessionTokenValid = false
+                println("[CN CALL][ENGINE] signaling session_invalid (reconnect disabled)")
+            }
+
+            else -> {
+                // Ignored frames stay transport-level, as in the Dart client.
+            }
+        }
+    }
+
+    /**
+     * Clears engine call state when a signaling frame ends a call. Only
+     * mutates when the frame references the current epoch's call; late frames
+     * from older calls are ignored (generation/callId guard). No LiveKit
+     * teardown here and no Telecom action: media was never started from
+     * signaling in this phase.
+     */
+    private fun clearScoredCall(callId: String, event: String) {
+        val cleared: Boolean
+        synchronized(lock) {
+            val matchesScored = callId == scoredCallId
+            val matchesPending =
+                callId.isNotEmpty() && callId == pendingIncomingCall?.callId
+            cleared = matchesScored || matchesPending
+            if (cleared) {
+                ++generation
+                scoredCallId = null
+                pendingIncomingCall = null
+                acceptedCallId = null
+            }
+        }
+        println(
+            "[CN CALL][ENGINE] signaling $event call_id=$callId cleared=$cleared",
+        )
+    }
+
+    private fun registerFutureComponents() {
+        // Reserved: activation-phase wiring (e.g. a NativeLiveKit listener
+        // bridging media-ready into callbacks.onMediaReady()). No-op until the
+        // native engine activates.
+    }
+
+    private fun unavailable(
+        operation: String,
+        callId: String,
+        callbacks: Callbacks? = null,
+        reason: String? = null,
+    ): Boolean {
+        val message = reason ?: "Native call engine is not configured: $operation"
+        println(
+            "[CN CALL][TELECOM] $message call_id=$callId",
+        )
+        callbacks?.onError(message)
+        return false
+    }
+}

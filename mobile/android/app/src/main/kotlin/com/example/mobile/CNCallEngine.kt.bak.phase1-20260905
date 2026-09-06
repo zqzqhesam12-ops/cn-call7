@@ -1,0 +1,119 @@
+package com.example.mobile
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+
+/**
+ * Temporary native call-engine boundary.
+ *
+ * LiveKit and WebSocket signaling remain on their current path. Until a native
+ * delegate is installed, Telecom operations fail explicitly rather than
+ * claiming that media is active.
+ */
+object CNCallEngine {
+    interface Callbacks {
+        fun onMediaReady()
+        fun onDisconnected()
+        fun onError(message: String)
+    }
+
+    interface Delegate {
+        fun initialize(context: Context, callbacks: Callbacks): Boolean
+        fun startIncoming(callId: String, callerId: String, callerName: String): Boolean
+        fun startOutgoing(callId: String, address: String): Boolean
+        fun answer(callId: String): Boolean
+        fun reject(callId: String): Boolean
+        fun disconnect(callId: String): Boolean
+        fun hold(callId: String): Boolean
+        fun unhold(callId: String): Boolean
+        fun setMute(callId: String, muted: Boolean): Boolean
+        fun setSpeaker(callId: String, speaker: Boolean): Boolean
+        fun release(callId: String): Boolean
+    }
+
+    @Volatile
+    var delegate: Delegate? = null
+
+    fun initialize(context: Context, callbacks: Callbacks): Boolean {
+        if (!hasRecordAudioPermission(context)) {
+            return unavailable(
+                "initialize",
+                "",
+                callbacks,
+                "RECORD_AUDIO permission is not granted",
+            )
+        }
+        return delegate?.initialize(context, callbacks)
+            ?: unavailable("initialize", "", callbacks)
+    }
+
+    fun hasRecordAudioPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun startIncoming(
+        callId: String,
+        callerId: String,
+        callerName: String,
+    ): Boolean {
+        return delegate?.startIncoming(callId, callerId, callerName)
+            ?: unavailable("startIncoming", callId)
+    }
+
+    fun startOutgoing(callId: String, address: String): Boolean {
+        return delegate?.startOutgoing(callId, address)
+            ?: unavailable("startOutgoing", callId)
+    }
+
+    fun answer(callId: String): Boolean {
+        return delegate?.answer(callId)
+            ?: unavailable("answer", callId)
+    }
+
+    fun reject(callId: String): Boolean {
+        return delegate?.reject(callId) ?: unavailable("reject", callId)
+    }
+
+    fun disconnect(callId: String): Boolean {
+        return delegate?.disconnect(callId) ?: unavailable("disconnect", callId)
+    }
+
+    fun setMute(callId: String, muted: Boolean): Boolean {
+        return delegate?.setMute(callId, muted) ?: unavailable("setMute", callId)
+    }
+
+    fun hold(callId: String): Boolean {
+        return delegate?.hold(callId) ?: unavailable("hold", callId)
+    }
+
+    fun unhold(callId: String): Boolean {
+        return delegate?.unhold(callId) ?: unavailable("unhold", callId)
+    }
+
+    fun setSpeaker(callId: String, speaker: Boolean): Boolean {
+        return delegate?.setSpeaker(callId, speaker) ?: unavailable("setSpeaker", callId)
+    }
+
+    fun release(callId: String): Boolean {
+        return delegate?.release(callId) ?: unavailable("release", callId)
+    }
+
+    private fun unavailable(
+        operation: String,
+        callId: String,
+        callbacks: Callbacks? = null,
+        reason: String? = null,
+    ): Boolean {
+        val message = reason ?: "Native call engine is not configured: $operation"
+        println(
+            "[CN CALL][TELECOM] $message call_id=$callId",
+        )
+        callbacks?.onError(message)
+        return false
+    }
+}

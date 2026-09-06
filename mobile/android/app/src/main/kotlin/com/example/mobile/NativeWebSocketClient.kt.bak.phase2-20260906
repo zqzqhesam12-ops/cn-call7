@@ -1,0 +1,317 @@
+package com.example.mobile
+
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONException
+import org.json.JSONObject
+import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Native WebSocket signaling client for CN CALL, backed by OkHttp.
+ *
+ * Protocol is copied from the current Dart implementation (CallSocket.dart)
+ * and the server endpoint server/main.py /ws/{user_id}:
+ *
+ *   URL      : wss://<host>/ws/<userId>?token=<token>
+ *              (host = cn-call5-production.up.railway.app, as ServerConfig.host)
+ *   Auth     : the access token is passed as the `token` query parameter.
+ *              An invalid/revoked token makes the server send
+ *              {"type":"session_invalid","reason":...} and close with 1008.
+ *   Handshake: the server sends {"type":"connected","user_id":<id>} right
+ *              after accepting; the socket is only usable once that frame
+ *              arrives (`connected` becomes true).
+ *   Frames   : JSON objects with a string `type` and flat string values
+ *              (call_id, target_id, from_id, caller_name, reason,
+ *              ring_expires_at, ...).
+ *
+ * Lifecycle contract:
+ *   - Socket closure is NOT call termination. On a close/error the client
+ *     schedules an exponential reconnect (1 << clamp(attempt, 0, 5) seconds)
+ *     with the same userId/token, unless reconnect was disabled.
+ *   - Only {"type":"session_invalid"} disables reconnect and closes the
+ *     socket for good.
+ *   - This class contains NO call-state logic, NO LiveKit, and touches NO
+ *     AudioManager/audio focus/microphone/Telecom/Flutter UI. It is the
+ *     transport only.
+ */
+interface NativeWebSocketListener {
+    fun onFrame(type: String, payload: Map<String, String>)
+    fun onClosed(code: Int, reason: String)
+    fun onError(t: Throwable)
+}
+
+/**
+ * OkHttp WebSocket client.
+ *
+ * Not started automatically: nothing connects until `connect(userId, token)`
+ * is invoked. Inactive in the current phase unless an external caller drives it.
+ */
+object NativeWebSocketClient {
+    private const val WS_HOST = "cn-call5-production.up.railway.app"
+    private const val WS_SCHEME = "wss"
+    private const val RECONNECT_DELAY_MAX_SHIFT = 5
+    private const val CLOSE_NORMAL = 1000
+    private const val CLOSE_SESSION_INVALID = 1008
+
+    private val listeners = CopyOnWriteArraySet<NativeWebSocketListener>()
+
+    private val scheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "cn-call-ws-reconnect").apply { isDaemon = true }
+        }
+
+    private val reconnectAttempt = AtomicInteger(0)
+    private val connecting = AtomicBoolean(false)
+
+    @Volatile private var webSocket: WebSocket? = null
+    @Volatile private var ready = false
+    @Volatile private var reconnectEnabled = false
+    @Volatile private var reconnectFuture: ScheduledFuture<*>? = null
+    @Volatile private var generation = 0
+    @Volatile private var currentUserId: String? = null
+    @Volatile private var currentToken: String? = null
+
+    /** True only after the server {"type":"connected"} handshake has arrived. */
+    @Volatile
+    var connected: Boolean = false
+        private set
+
+    private val okHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(25, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /** Registers a frame/state listener. */
+    fun addListener(listener: NativeWebSocketListener) {
+        listeners.add(listener)
+    }
+
+    fun removeListener(listener: NativeWebSocketListener) {
+        listeners.remove(listener)
+    }
+
+    /**
+     * Opens (or re-opens) the authenticated WebSocket for a user.
+     *
+     * Returns true once the connection attempt has been enqueued (or the
+     * socket is already connected with the same credentials). The socket is
+     * only usable after [connected] becomes true (server handshake).
+     */
+    fun connect(userId: String, token: String): Boolean {
+        if (userId.isBlank() || token.isBlank()) return false
+
+        var myGeneration = 0
+        synchronized(this) {
+            if (connected && userId == currentUserId && token == currentToken) return true
+            if (connecting.get()) return true
+
+            // Mark connecting + bump the generation atomically BEFORE any
+            // stale in-flight attempt can observe itself as current. Once we
+            // win here, no other caller can also open a socket, and a loser
+            // simply shares this attempt (mirrors CallSocket.connect()).
+            connecting.set(true)
+            myGeneration = ++generation
+            currentUserId = userId
+            currentToken = token
+            reconnectEnabled = true
+            cancelPendingReconnect()
+            closeQuietly()
+        }
+
+        val url = "$WS_SCHEME://$WS_HOST/ws/$userId?token=$token"
+        val request = Request.Builder().url(url).build()
+
+        okHttpClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                if (!isCurrentGeneration(myGeneration)) {
+                    ws.close(CLOSE_NORMAL, "superseded")
+                    return
+                }
+                webSocket = ws
+                connecting.set(false)
+                // Not ready until the server {"type":"connected"} frame arrives.
+            }
+
+            override fun onMessage(ws: WebSocket, text: String) {
+                if (!isCurrentGeneration(myGeneration)) return
+                try {
+                    val json = JSONObject(text)
+                    val type = json.optString("type", "")
+                    val payload = toFlatMap(json)
+
+                    when (type) {
+                        "connected" -> {
+                            ready = true
+                            connected = true
+                            reconnectAttempt.set(0)
+                            dispatch(type, payload)
+                        }
+                        "session_invalid" -> {
+                            reconnectEnabled = false
+                            cancelPendingReconnect()
+                            closeQuietly()
+                            dispatch(type, payload)
+                        }
+                        else -> dispatch(type, payload)
+                    }
+                } catch (e: JSONException) {
+                    notifyError(e)
+                }
+            }
+
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                ws.close(code, reason)
+            }
+
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (!isCurrentGeneration(myGeneration)) return
+                if (webSocket === ws) webSocket = null
+                connecting.set(false)
+                ready = false
+                connected = false
+                notifyClosed(code, reason)
+                if (reconnectEnabled && code != CLOSE_SESSION_INVALID) {
+                    scheduleReconnect()
+                }
+            }
+
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (!isCurrentGeneration(myGeneration)) return
+                if (webSocket === ws) webSocket = null
+                connecting.set(false)
+                ready = false
+                connected = false
+                notifyError(t)
+                if (reconnectEnabled) scheduleReconnect()
+            }
+        })
+        return true
+    }
+
+    /**
+     * Sends a JSON control frame {"type": <type>, ...payload}.
+     * Returns true only if the socket is connected (handshake done) and the
+     * frame was handed to OkHttp.
+     */
+    fun send(type: String, payload: Map<String, String>): Boolean {
+        val ws = webSocket ?: return false
+        if (!ready) return false
+        val message = JSONObject()
+        message.put("type", type)
+        for ((key, value) in payload) message.put(key, value)
+        return ws.send(message.toString())
+    }
+
+    /** Disables reconnect and closes the socket for good. */
+    fun disconnect() {
+        generation++
+        reconnectEnabled = false
+        cancelPendingReconnect()
+        connecting.set(false)
+        closeQuietly()
+        currentUserId = null
+        currentToken = null
+    }
+
+    /**
+     * Reconnect delay in milliseconds, identical to CallSocket.dart:
+     *   1 << clamp(attempt, 0, 5)  seconds.
+     */
+    fun recalcBackoffMs(attempt: Int): Long {
+        val shifted = attempt.coerceIn(0, RECONNECT_DELAY_MAX_SHIFT)
+        return (1L shl shifted) * 1000L
+    }
+
+    // ------------------------------------------------------------
+    // Internal helpers
+    // ------------------------------------------------------------
+
+    private fun isCurrentGeneration(expected: Int): Boolean = expected == generation
+
+    private fun closeQuietly() {
+        val ws = webSocket
+        webSocket = null
+        ready = false
+        connected = false
+        try {
+            ws?.close(CLOSE_NORMAL, "cn-call-close")
+        } catch (_: Exception) {
+            // Best effort; OkHttp also cancels on GC/teardown.
+        }
+    }
+
+    private fun toFlatMap(json: JSONObject): Map<String, String> {
+        val result = LinkedHashMap<String, String>(json.length())
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            result[key] = value?.toString() ?: ""
+        }
+        return result
+    }
+
+    private fun scheduleReconnect() {
+        val userId = currentUserId ?: return
+        val token = currentToken ?: return
+        if (!reconnectEnabled) return
+        if (reconnectFuture != null) return
+
+        val delayMs = recalcBackoffMs(reconnectAttempt.getAndIncrement())
+        reconnectFuture = scheduler.schedule({
+            reconnectFuture = null
+            try {
+                connect(userId, token)
+            } catch (e: Exception) {
+                scheduleReconnect()
+            }
+        }, delayMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun cancelPendingReconnect() {
+        reconnectFuture?.cancel(false)
+        reconnectFuture = null
+    }
+
+    private fun dispatch(type: String, payload: Map<String, String>) {
+        for (listener in listeners) {
+            try {
+                listener.onFrame(type, payload)
+            } catch (e: Exception) {
+                // A misbehaving listener must not break the socket loop.
+            }
+        }
+    }
+
+    private fun notifyClosed(code: Int, reason: String) {
+        for (listener in listeners) {
+            try {
+                listener.onClosed(code, reason)
+            } catch (e: Exception) {
+                // Ignored.
+            }
+        }
+    }
+
+    private fun notifyError(t: Throwable) {
+        for (listener in listeners) {
+            try {
+                listener.onError(t)
+            } catch (e: Exception) {
+                // Ignored.
+            }
+        }
+    }
+}

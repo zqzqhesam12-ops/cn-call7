@@ -23,124 +23,9 @@ const MethodChannel _telecomChannel = MethodChannel('cn_call/call');
 const MethodChannel _telecomEventsChannel =
     MethodChannel('cn_call/telecom_events');
 
-Future<void> _announceCoreTelecomFlutterReady() async {
-  try {
-    await _telecomChannel.invokeMethod(
-      'coreTelecomFlutterReady',
-    );
+enum CnSetupState { unconfigured, checking, ready }
 
-    print(
-      '[CN CALL][CORE TELECOM] Flutter ready announced',
-    );
-  } catch (e) {
-    print(
-      '[CN CALL][CORE TELECOM] Flutter ready handshake failed: $e',
-    );
-  }
-}
-
-Future<void> _handleCoreTelecomAction(
-  Map<Object?, Object?> arguments,
-) async {
-  final action = arguments['action']?.toString().trim() ?? '';
-  final callId = arguments['callId']?.toString().trim() ?? '';
-  final peerId = arguments['peerId']?.toString().trim() ?? '';
-
-  if (action.isEmpty || callId.isEmpty || peerId.isEmpty) {
-    print(
-      '[CN CALL][CORE TELECOM] '
-      'ignored Flutter event with incomplete identity',
-    );
-    return;
-  }
-
-  print(
-    '[CN CALL][CORE TELECOM][FLUTTER EVENT] '
-    'action=$action call_id=$callId peer_id=$peerId',
-  );
-
-  switch (action) {
-    case 'answer':
-      await RtcCallManager.instance.prepareIncomingCall(
-        callId: callId,
-        callerId: peerId,
-      );
-      if (RtcCallManager.instance.currentCallId != callId ||
-          RtcCallManager.instance.remoteUserId != peerId) {
-        print(
-          '[CN CALL][CORE TELECOM] '
-          'answer identity mismatch call_id=$callId peer_id=$peerId',
-        );
-        return;
-      }
-      await RtcCallManager.instance.acceptCall(
-        callerId: peerId,
-        callId: callId,
-        userInitiated: true,
-      );
-      break;
-
-    case 'reject':
-      await RtcCallManager.instance.rejectCall(
-        callerId: peerId,
-        callId: callId,
-      );
-      break;
-
-    case 'hangup':
-      // The active notification's End action converges on the same Dart
-      // terminal path as the custom active-call screen.
-      await RtcCallManager.instance.hangupForCall(
-        callId: callId,
-        peerId: peerId,
-      );
-      break;
-
-    case 'ended':
-      await RtcCallManager.instance.endFromTelecom(
-        callId: callId,
-        reason: 'ended',
-      );
-      break;
-
-    default:
-      print(
-        '[CN CALL][CORE TELECOM] '
-        'unknown Flutter action=$action call_id=$callId',
-      );
-  }
-}
-
-Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
-  final action = arguments['action']?.toString() ?? '';
-  final callId = arguments['callId']?.toString() ?? '';
-  final peerId = arguments['peerId']?.toString() ?? '';
-  if (callId.isEmpty || peerId.isEmpty) return;
-  print('[CN CALL][CALL ACTION RECEIVED] action=$action call_id=$callId');
-  if (action == 'outgoing') {
-    await RtcCallManager.instance.startCall(targetId: peerId, callId: callId);
-  } else if (action == 'reject') {
-    await RtcCallManager.instance.rejectCall(callerId: peerId, callId: callId);
-  } else if (action == 'ended') {
-    await RtcCallManager.instance.endFromTelecom(callId: callId, reason: 'ended');
-  }
-  final prefs = await SharedPreferences.getInstance();
-  final raw = prefs.getString('flutter.cn_call_core_telecom_actions_v1') ?? '[]';
-  try {
-    final queued = jsonDecode(raw);
-    if (queued is List) {
-      queued.removeWhere((item) => item is Map &&
-          item['action']?.toString() == action &&
-          item['callId']?.toString() == callId);
-      await prefs.setString(
-        'flutter.cn_call_core_telecom_actions_v1',
-        jsonEncode(queued),
-      );
-    }
-  } catch (_) {
-    // The cold-start drain will discard a malformed queue safely.
-  }
-}
+const _cnSetupPrefKey = 'cn_call_setup_complete_v1';
 
 void _installTelecomEventHandler() {
   _telecomEventsChannel.setMethodCallHandler((call) async {
@@ -161,113 +46,27 @@ void _installTelecomEventHandler() {
       }
       return;
     }
-    if (call.method == 'callAction') {
-      await _handleTelecomAction(arguments);
+    if (call.method == 'active') {
+      // Native Telecom call reached ACTIVE (media ready); keep the in-app
+      // CallScreen bound to the same native call — no Flutter LiveKit of its
+      // own for this callId.
+      final callId = arguments['callId']?.toString() ?? '';
+      if (callId.isNotEmpty) {
+        await RtcCallManager.instance.onNativeCallActive();
+      }
       return;
     }
-
-    if (call.method == 'coreTelecomAction') {
-      await _handleCoreTelecomAction(arguments);
+    if (call.method == 'ended') {
+      // Native Telecom call ended (setDisconnected already reached; the single
+      // terminal frame was sent by the native engine). Flutter mirrors local
+      // state only.
+      final callId = arguments['callId']?.toString() ?? '';
+      if (callId.isNotEmpty) {
+        await RtcCallManager.instance.handleNativeCallEnded(callId);
+      }
       return;
     }
   });
-}
-
-@pragma('vm:entry-point')
-Future<void> telecomBackgroundMain() async {
-  WidgetsFlutterBinding.ensureInitialized();
-
-  _installTelecomEventHandler();
-
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-
-    RtcCallManager.instance.startListening();
-
-    final restored = await CallSession.instance.restoreCredentialsOnly();
-
-    if (!restored) {
-      print('[CN CALL][TELECOM] background session restore failed');
-      return;
-    }
-
-    await _announceCoreTelecomFlutterReady();
-
-    final prefs = await SharedPreferences.getInstance();
-    final queued = prefs.getString('flutter.cn_call_core_telecom_actions_v1') ?? '[]';
-    final actions = <Map<String, dynamic>>[];
-    try {
-      final decoded = jsonDecode(queued);
-      if (decoded is List) {
-        for (final item in decoded) {
-          if (item is Map) actions.add(Map<String, dynamic>.from(item));
-        }
-      }
-    } catch (_) {
-      print('[CN CALL][TELECOM] invalid persisted action queue');
-    }
-
-    for (final actionData in actions) {
-      final telecomAction = actionData['action']?.toString() ?? '';
-      final telecomCallId = actionData['callId']?.toString() ?? '';
-      final telecomPeerId = actionData['peerId']?.toString() ?? '';
-      if (telecomCallId.isEmpty || telecomPeerId.isEmpty) continue;
-      print('[CN CALL][TELECOM ACTION DEQUEUED] action=$telecomAction call_id=$telecomCallId');
-      if (telecomAction == 'outgoing') {
-      await RtcCallManager.instance.startCall(
-        targetId: telecomPeerId,
-        callId: telecomCallId,
-      );
-      } else if (telecomAction == 'reject') {
-      await RtcCallManager.instance.rejectCall(
-        callerId: telecomPeerId,
-        callId: telecomCallId,
-      );
-      } else if (telecomAction == 'answer') {
-      if (await CallSession.instance.isCallEnded(telecomCallId)) {
-        continue;
-      }
-      await RtcCallManager.instance.prepareIncomingCall(
-        callId: telecomCallId,
-        callerId: telecomPeerId,
-      );
-      if (RtcCallManager.instance.currentCallId != telecomCallId ||
-          RtcCallManager.instance.remoteUserId != telecomPeerId) {
-        print(
-          '[CN CALL][TELECOM] '
-          'answer identity mismatch call_id=$telecomCallId '
-          'peer_id=$telecomPeerId',
-        );
-        continue;
-      }
-      await RtcCallManager.instance.acceptCall(
-        callerId: telecomPeerId,
-        callId: telecomCallId,
-        userInitiated: true,
-      );
-      } else if (telecomAction == 'ended') {
-      await RtcCallManager.instance.endFromTelecom(
-        callId: telecomCallId,
-        reason: 'ended',
-      );
-      }
-    }
-
-    // Actions are removed only after credential restore and the Dart lifecycle
-    // handlers have run.  Duplicate delivery is harmless because
-    // RtcCallManager gates every action by call_id/state.
-    await prefs.remove('flutter.cn_call_core_telecom_actions_v1');
-
-    print(
-      '[CN CALL][TELECOM] background call action processed',
-    );
-  } catch (e, stackTrace) {
-    print(
-      '[CN CALL][TELECOM] background entrypoint error: $e\n$stackTrace',
-    );
-  }
 }
 
 /// Entry point hosted only by CNCallIncomingActivity.  It deliberately avoids
@@ -331,26 +130,6 @@ class _DedicatedIncomingCallFlow extends StatelessWidget {
           );
         }
         return;
-      }
-      final answerClaimed = await const MethodChannel('cn_call/call').invokeMethod<bool>(
-        'claimCoreTelecomAnswer',
-        <String, dynamic>{'callId': callId},
-      ) ?? false;
-      if (!answerClaimed) {
-        // If claim failed, check if a native runtime exists.
-        // For cold-start (CNCallIncomingActivity), a native runtime SHOULD exist.
-        // If it exists and claim failed, another native path (onAnswer/CallStyle)
-        // already owns the answer - do not proceed.
-        final hasRuntime = await const MethodChannel('cn_call/call').invokeMethod<bool>(
-          'hasNativeRuntime',
-          <String, dynamic>{'callId': callId},
-        ) ?? false;
-        if (hasRuntime) {
-          print('[CN CALL][COLD START] Answer already claimed by native path, aborting Flutter accept call_id=$callId');
-          return;
-        }
-        // No native runtime (should not happen for cold start, but safe fallback): proceed.
-        print('[CN CALL][COLD START] No native runtime, proceeding with Flutter accept call_id=$callId');
       }
       await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
       if (!context.mounted) return;
@@ -433,6 +212,12 @@ class _CNCallAppState extends State<CNCallApp> {
   }
 
   Future<void> _restoreSession() async {
+    // Fresh isolate: no live Flutter call can exist yet, so a lingering
+    // `flutter` WS-owner marker or active-call marker from a previous process
+    // (crash / OS kill mid-call) is stale. Clear it BEFORE restoreSession's
+    // socket.connect() so the next native acquisition/call is never refused.
+    await CallSession.instance.clearStaleStateForFreshStartup();
+
     final restored = await CallSession.instance.restoreSession();
 
     if (restored) {
@@ -481,17 +266,145 @@ class LoginScreen extends StatefulWidget {
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen> {
+class _LoginScreenState extends State<LoginScreen>
+    with WidgetsBindingObserver {
   final userIdController = TextEditingController();
   final passwordController = TextEditingController();
 
   bool hidePassword = true;
 
+  CnSetupState _setupState = CnSetupState.checking;
+  bool _hasReadPhoneNumbers = false;
+  bool _phoneAccountEnabled = false;
+  bool _setupCheckInProgress = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _verifySetup();
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     userIdController.dispose();
     passwordController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _verifySetup();
+    }
+  }
+
+  Future<void> _verifySetup() async {
+    if (_setupCheckInProgress) return;
+    _setupCheckInProgress = true;
+    if (mounted) setState(() => _setupState = CnSetupState.checking);
+
+    var hasPermission = true;
+    try {
+      hasPermission =
+          await _telecomChannel.invokeMethod<bool>(
+                'hasReadPhoneNumbersPermission',
+              ) ??
+              false;
+    } on PlatformException {
+      hasPermission = false;
+    }
+
+    var accountEnabled = false;
+    if (hasPermission) {
+      try {
+        await _telecomChannel.invokeMethod<bool>('registerCNCallPhoneAccount');
+      } on PlatformException {
+        // Registration is best-effort; enablement is what gates the login.
+      }
+      try {
+        accountEnabled =
+            await _telecomChannel.invokeMethod<bool>(
+                  'isCNCallPhoneAccountEnabled',
+                ) ??
+                false;
+      } on PlatformException {
+        accountEnabled = false;
+      }
+    }
+
+    _setupCheckInProgress = false;
+    if (!mounted) return;
+
+    if (hasPermission && accountEnabled) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_cnSetupPrefKey, true);
+      if (!mounted) return;
+      setState(() {
+        _setupState = CnSetupState.ready;
+        _hasReadPhoneNumbers = true;
+        _phoneAccountEnabled = true;
+      });
+    } else {
+      setState(() {
+        _hasReadPhoneNumbers = hasPermission;
+        _phoneAccountEnabled = accountEnabled;
+        _setupState = CnSetupState.unconfigured;
+      });
+    }
+  }
+
+  Future<void> _runSetup() async {
+    var hasPermission = false;
+    try {
+      hasPermission =
+          await _telecomChannel.invokeMethod<bool>(
+                'hasReadPhoneNumbersPermission',
+              ) ??
+              false;
+    } on PlatformException {
+      hasPermission = false;
+    }
+
+    if (!hasPermission) {
+      _message('فعّل صلاحية أرقام الهاتف من إعدادات تطبيق CN CALL ثم عد للتطبيق');
+      try {
+        await _telecomChannel.invokeMethod<bool>('openAppSettings');
+      } on PlatformException {
+        // Opening settings is best-effort; the resume re-check still runs.
+      }
+      return;
+    }
+
+    try {
+      await _telecomChannel.invokeMethod<bool>('registerCNCallPhoneAccount');
+    } on PlatformException {
+      // best-effort; enablement check below is authoritative.
+    }
+
+    var enabled = false;
+    try {
+      enabled =
+          await _telecomChannel.invokeMethod<bool>(
+                'isCNCallPhoneAccountEnabled',
+              ) ??
+              false;
+    } on PlatformException {
+      enabled = false;
+    }
+
+    if (!enabled) {
+      _message('فعّل حساب CN CALL من إعدادات المكالمات ثم عد للتطبيق');
+      try {
+        await _telecomChannel.invokeMethod<bool>('openTelecomCallSettings');
+      } on PlatformException {
+        // Opening settings is best-effort; the resume re-check still runs.
+      }
+      return;
+    }
+
+    await _verifySetup();
   }
 
   void openRegister() {
@@ -502,6 +415,11 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> login() async {
+    if (_setupState != CnSetupState.ready) {
+      _message('أكمل إعداد CN CALL أولًا عبر زر "إعداد CN CALL" ثم سجّل الدخول');
+      return;
+    }
+
     final userId = userIdController.text.trim();
     final password = passwordController.text;
 
@@ -581,6 +499,71 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  Widget _buildSetupButton() {
+    final checking = _setupState == CnSetupState.checking;
+    final ready = _setupState == CnSetupState.ready;
+
+    final Color background;
+    final Color foreground;
+    final String label;
+    final IconData icon;
+
+    if (ready) {
+      background = const Color(0xFF00A85A);
+      foreground = Colors.white;
+      icon = Icons.check_circle;
+      label = 'CN CALL جاهز ✓';
+    } else if (checking) {
+      background = Colors.grey.shade800;
+      foreground = Colors.white70;
+      icon = Icons.sync;
+      label = 'جارٍ التحقق...';
+    } else {
+      background = const Color(0xFF00E676);
+      foreground = Colors.black;
+      icon = Icons.phonelink_setup_outlined;
+      label = 'إعداد CN CALL';
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      height: 54,
+      child: FilledButton(
+        onPressed: checking ? null : _runSetup,
+        style: FilledButton.styleFrom(
+          backgroundColor: background,
+          foregroundColor: foreground,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
+        ),
+        child: checking
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: Colors.white70,
+                ),
+              )
+            : Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 20),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
@@ -651,6 +634,28 @@ class _LoginScreenState extends State<LoginScreen> {
 
                     const SizedBox(height: 24),
 
+                    _buildSetupButton(),
+
+                    if (_setupState == CnSetupState.unconfigured)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Text(
+                          !_hasReadPhoneNumbers
+                              ? 'يلزم تفعيل صلاحية أرقام الهاتف من إعدادات تطبيق CN CALL'
+                              : !_phoneAccountEnabled
+                                  ? 'يلزم تفعيل حساب CN CALL من "إعدادات المكالمات" ثم العودة'
+                                  : 'أكمل إعداد CN CALL من زر "إعداد CN CALL"',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.amber.shade200,
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+
+                    const SizedBox(height: 14),
+
                     _PrimaryButton(text: 'تسجيل الدخول', onPressed: login),
 
                     const SizedBox(height: 12),
@@ -714,6 +719,7 @@ class _HomeScreenState extends State<HomeScreen>
   bool _incomingCallScreenOpen = false;
   String? _incomingCallScreenCallId;
   bool _canUseFullScreenIntent = true;
+  bool? _cnCallPhoneAccountEnabled;
 
   void _closeIncomingCallScreen() {
     if (!_incomingCallScreenOpen) return;
@@ -779,14 +785,6 @@ class _HomeScreenState extends State<HomeScreen>
             id: callerId,
             callId: callId,
             onAccept: () async {
-              final _ = await const MethodChannel('cn_call/call').invokeMethod<bool>(
-                'claimCoreTelecomAnswer',
-                <String, dynamic>{'callId': callId},
-              ) ?? false;
-              // Open-app incoming calls arrive over the live WebSocket and never
-              // create a Core-Telecom runtime, so this claim is best-effort: a
-              // false result must not abort the normal accept lifecycle. When a
-              // valid native runtime does exist the claim may still return true.
               await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
               if (context.mounted) Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => CallScreen(name: callerName, id: callerId)));
             },
@@ -857,6 +855,53 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _openFullScreenIntentSettings() async {
     if (_incomingCallScreenOpen) return;
     await _telecomChannel.invokeMethod<bool>('openFullScreenIntentSettings');
+  }
+
+  Future<void> _registerCNCallPhoneAccount() async {
+    try {
+      final registered = await _telecomChannel.invokeMethod<bool>(
+        'registerCNCallPhoneAccount',
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            registered == true
+                ? 'CN CALL account registered'
+                : 'CN CALL account registration returned false',
+          ),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Registration failed: ${error.message ?? error.code}')),
+      );
+    }
+  }
+
+  Future<void> _checkCNCallPhoneAccountEnabled() async {
+    try {
+      final enabled = await _telecomChannel.invokeMethod<bool>(
+        'isCNCallPhoneAccountEnabled',
+      );
+      if (!mounted) return;
+      setState(() => _cnCallPhoneAccountEnabled = enabled);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            enabled == true
+                ? 'CN CALL account is enabled'
+                : 'CN CALL account is not enabled',
+          ),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Check failed: ${error.message ?? error.code}')),
+      );
+    }
   }
 
   Future<void> _loadLocalData() async {
@@ -1086,27 +1131,79 @@ class _HomeScreenState extends State<HomeScreen>
 
     await _addHistory(name: name, id: id, incoming: false);
 
-    final callId = const Uuid().v4();
-    final started = await RtcCallManager.instance.startCall(
-      targetId: id,
-      callId: callId,
-    );
+      final callId = const Uuid().v4();
 
-    print('[CN CALL][OUTGOING SIGNAL RESULT] started=$started call_id=$callId');
-    if (!started) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تعذر بدء المكالمة')),
+      bool started = false;
+      var permissionDenied = false;
+      try {
+        started = await _telecomChannel.invokeMethod<bool>(
+              'placeCNCall',
+              <String, dynamic>{
+                'callId': callId,
+                'targetId': id,
+              },
+            ) ??
+            false;
+      } on PlatformException catch (error) {
+        permissionDenied = error.code == 'permission_denied';
+        print(
+          '[CN CALL][TELECOM OUTGOING FAILED] call_id=$callId '
+          'code=${error.code} message=${error.message}',
+        );
+      } catch (error) {
+        print('[CN CALL][TELECOM OUTGOING FAILED] call_id=$callId error=$error');
+      }
+
+      print(
+        '[CN CALL][TELECOM OUTGOING RESULT] '
+        'started=$started call_id=$callId',
       );
-      return;
-    }
 
-    if (!mounted) return;
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => CallScreen(name: name, id: id)),
-    );
-  }
+      if (!started) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              permissionDenied
+                  ? 'لبدء المكالمة يجب منح صلاحية إجراء المكالمات من إعدادات CN CALL'
+                  : 'تعذر بدء المكالمة',
+            ),
+            backgroundColor: permissionDenied ? Colors.red.shade800 : null,
+            action: permissionDenied
+                ? SnackBarAction(
+                    label: 'الإعدادات',
+                    onPressed: () async {
+                      try {
+                        await _telecomChannel
+                            .invokeMethod<bool>('openAppSettings');
+                      } on PlatformException {
+                        // Best-effort; the permission can be toggled manually.
+                      }
+                    },
+                  )
+                : null,
+          ),
+        );
+        return;
+      }
+
+      // Bind the in-app manager to the SAME native Telecom call: the single
+      // callId minted here travels unchanged into CNCallEngine via the
+      // placeCNCall extras. The CallScreen then mirrors the native connection
+      // (active/ended events) and ends it through Telecom — no second Uuid,
+      // no Flutter WebSocket, no separate signaling for this callId.
+      final manager = RtcCallManager.instance;
+      manager.currentCallId = callId;
+      manager.remoteUserId = id;
+      manager.caller = true;
+      manager.inCall = false;
+      manager.state = CallState.ringing;
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => CallScreen(name: name, id: id)),
+      );
+    }
 
   @override
   void dispose() {
@@ -1253,6 +1350,52 @@ class _HomeScreenState extends State<HomeScreen>
                               ),
                             ),
                           ],
+                        ),
+                      ),
+
+                      const SizedBox(height: 20),
+
+                      Card(
+                        color: const Color(0xFF151515),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              const Text(
+                                'CN CALL PhoneAccount test',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              OutlinedButton(
+                                onPressed: _registerCNCallPhoneAccount,
+                                child: const Text('Register CN CALL Account'),
+                              ),
+                              const SizedBox(height: 8),
+                              OutlinedButton(
+                                onPressed: _checkCNCallPhoneAccountEnabled,
+                                child: const Text('Check CN CALL Enabled'),
+                              ),
+                              if (_cnCallPhoneAccountEnabled != null) ...[
+                                const SizedBox(height: 8),
+                                Text(
+                                  _cnCallPhoneAccountEnabled == true
+                                      ? 'Enabled'
+                                      : 'Not enabled',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: _cnCallPhoneAccountEnabled == true
+                                        ? const Color(0xFF00E676)
+                                        : Colors.orange,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
                         ),
                       ),
 
@@ -1712,7 +1855,10 @@ class _CallScreenState extends State<CallScreen> {
 
     _closing = true;
 
-    await RtcCallManager.instance.hangup();
+    // Same native Telecom call as the one created by startCall → placeCNCall:
+    // end it through its Connection (single terminal path). Flutter sends no
+    // WebSocket hangup for this call.
+    await RtcCallManager.instance.endActiveNativeTelecomCall();
 
     if (!mounted) return;
 

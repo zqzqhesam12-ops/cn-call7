@@ -1,0 +1,242 @@
+package com.example.mobile
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+
+/**
+ * CN CALL native call-engine boundary.
+ *
+ * PHASE 1: This object now carries the real delegate structure,
+ * initialization guard, lifecycle hooks and the future-signaling surface.
+ * It does NOT start any WebSocket or LiveKit connection yet and does NOT
+ * change current call behavior. The Flutter/Dart call path keeps working
+ * unchanged.
+ *
+ * Ownership split (architecture report):
+ *   - CNCallEngine  → signaling + media transport only (native WS + LiveKit RTP).
+ *   - CNCallConnection → Telecom lifecycle only (state transitions + audio).
+ *   - Audio focus/routing/microphone lifecycle → owned by Android Telecom.
+ *   The engine must NEVER acquire audio focus, set MODE_IN_COMMUNICATION, or
+ *   call setSpeakerphoneOn for call audio.
+ */
+object CNCallEngine {
+
+    /**
+     * Engine runtime state. Phase 1 only tracks INITIALIZED/COMPONENTS_READY;
+     * no socket or room is created until a later phase activates it.
+     */
+    enum class State {
+        UNINITIALIZED,
+        INITIALIZED,
+        COMPONENTS_READY,
+        IN_CALL,
+        TERMINATED,
+    }
+
+    /**
+     * Callbacks surfaced up to the Telecom layer (CNCallConnection).
+     * These are the single channel that translates media/signaling progress
+     * into Connection state.
+     */
+    interface Callbacks {
+        fun onMediaReady()
+        fun onDisconnected()
+        fun onError(message: String)
+    }
+
+    /**
+     * The native signaling + media operations. CNCallEngineImpl will provide
+     * the real implementation (NativeWebSocketClient + NativeLiveKit) in a
+     * later phase.
+     */
+    interface Delegate {
+        fun initialize(context: Context, callbacks: Callbacks): Boolean
+        fun startIncoming(callId: String, callerId: String, callerName: String): Boolean
+        fun startOutgoing(callId: String, address: String): Boolean
+        fun answer(callId: String): Boolean
+        fun reject(callId: String): Boolean
+        fun disconnect(callId: String): Boolean
+        fun hold(callId: String): Boolean
+        fun unhold(callId: String): Boolean
+        fun setMute(callId: String, muted: Boolean): Boolean
+        fun setSpeaker(callId: String, speaker: Boolean): Boolean
+        fun release(callId: String): Boolean
+    }
+
+    /**
+     * Future native engine implementation. PHASE 1: interface placeholder.
+     * In later phases this will orchestrate NativeWebSocketClient and
+     * NativeLiveKit (both intentionally inactive now).
+     */
+    class CNCallEngineImpl : Delegate {
+        override fun initialize(context: Context, callbacks: Callbacks): Boolean {
+            // Not activated in Phase 1.
+            @Suppress("UNUSED_VARIABLE")
+            val ctx = context
+            return false
+        }
+
+        override fun startIncoming(callId: String, callerId: String, callerName: String): Boolean =
+            false
+
+        override fun startOutgoing(callId: String, address: String): Boolean = false
+
+        override fun answer(callId: String): Boolean = false
+
+        override fun reject(callId: String): Boolean = false
+
+        override fun disconnect(callId: String): Boolean = false
+
+        override fun hold(callId: String): Boolean = false
+
+        override fun unhold(callId: String): Boolean = false
+
+        override fun setMute(callId: String, muted: Boolean): Boolean = false
+
+        override fun setSpeaker(callId: String, speaker: Boolean): Boolean = false
+
+        override fun release(callId: String): Boolean = false
+    }
+
+    /** Real delegate. Phase 1 installs the placeholder engine, still inactive. */
+    private var delegate: Delegate? = null
+
+    /** Phase 1 lifecycle state. */
+    @Volatile
+    var state: State = State.UNINITIALIZED
+        private set
+
+    @Volatile
+    private var callbacks: Callbacks? = null
+
+    /**
+     * Installs the native engine and records the working Context for the
+     * future native path. PHASE 1: idempotent (already-initialized is a
+     * success); the placeholder delegate reports not-ready rather than
+     * claiming media. It performs no I/O and no connection.
+     */
+    fun initialize(context: Context, callbacks: Callbacks): Boolean {
+        if (!hasRecordAudioPermission(context)) {
+            return unavailable(
+                "initialize",
+                "",
+                callbacks,
+                "RECORD_AUDIO permission is not granted",
+            )
+        }
+        this.callbacks = callbacks
+        if (delegate == null) {
+            delegate = CNCallEngineImpl()
+        }
+        if (state == State.UNINITIALIZED) {
+            state = State.INITIALIZED
+        } else if (state == State.TERMINATED) {
+            // Re-usable after a full teardown.
+            state = State.INITIALIZED
+        }
+        val ready = delegate?.initialize(context, callbacks) == true
+        if (ready) {
+            state = State.COMPONENTS_READY
+            registerFutureComponents()
+        }
+        return ready
+    }
+
+    fun hasRecordAudioPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun isReady(): Boolean = state == State.COMPONENTS_READY && delegate != null
+
+    fun startIncoming(
+        callId: String,
+        callerId: String,
+        callerName: String,
+    ): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun startOutgoing(callId: String, address: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun answer(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun reject(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun disconnect(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun setMute(callId: String, muted: Boolean): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun setSpeaker(callId: String, speaker: Boolean): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun hold(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun unhold(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    fun release(callId: String): Boolean {
+        // Phase 1: do not activate any native path (Flutter path stays).
+        return false
+    }
+
+    /**
+     * Lifecycle hooks for the future native engine. Later phases will hook
+     * these into the Connection/FGS lifecycle. Phase 1 keeps them as the
+     * documented contract only.
+     */
+    fun onCallStarted(callId: String) {
+        // Reserved: mark engine state IN_CALL when native media activates.
+    }
+
+    fun onCallEnded(reason: String) {
+        // Reserved: teardown native WS/LiveKit when native media activates.
+        state = State.TERMINATED
+    }
+
+    private fun registerFutureComponents() {
+        // Reserved: e.g. wire NativeWebSocketClient listener bridge into
+        // callbacks. No-op until the native engine activates.
+    }
+
+    private fun unavailable(
+        operation: String,
+        callId: String,
+        callbacks: Callbacks? = null,
+        reason: String? = null,
+    ): Boolean {
+        val message = reason ?: "Native call engine is not configured: $operation"
+        println(
+            "[CN CALL][TELECOM] $message call_id=$callId",
+        )
+        callbacks?.onError(message)
+        return false
+    }
+}

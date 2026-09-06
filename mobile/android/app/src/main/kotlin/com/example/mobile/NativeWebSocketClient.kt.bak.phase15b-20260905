@@ -1,0 +1,96 @@
+package com.example.mobile
+
+import java.util.concurrent.CopyOnWriteArraySet
+
+/**
+ * Native WebSocket signaling client for CN CALL.
+ *
+ * PHASE 1: This class is intentionally INACTIVE. It defines the future
+ * native signaling surface that will replace CallSocket.dart in a later
+ * phase. It is NOT connected and does NOT open any socket here.
+ *
+ * Design contract (mirrors server/main.py /ws/{user_id} protocol and
+ * CallSocket.dart behavior):
+ *   - connect(userId, token): open ws://<host>/ws/<userId>?token=<token>,
+ *     wait for the {type:"connected"} handshake before considering the
+ *     socket ready.
+ *   - send(type, payload): encode and enqueue a signaling frame.
+ *   - Inbound frames are dispatched to listeners (call_started,
+ *     call_accept, call_reject, call_cancelled, hangup, connected, timeout,
+ *     signaling_rejected, session_invalid).
+ *   - A socket close is NOT a hangup: it only schedules an exponential
+ *     reconnect (1 << clamp(attempt, 0, 5)) with the same userId/token.
+ *     Call ownership is kept at the server until an explicit terminal frame.
+ */
+interface NativeWebSocketListener {
+    fun onFrame(type: String, payload: Map<String, String>)
+    fun onClosed(code: Int, reason: String)
+    fun onError(t: Throwable)
+}
+
+/**
+ * Behavioural placeholder for the future native WebSocket client.
+ *
+ * The concrete transport (OkHttp WebSocket vs. raw java.net) is not wired in
+ * Phase 1. These methods are declared so the engine has a stable seam to code
+ * against; callers keep using them as documentation of the future contract.
+ */
+object NativeWebSocketClient {
+    private val listeners = CopyOnWriteArraySet<NativeWebSocketListener>()
+
+    private const val RECONNECT_DELAY_MAX_SHIFT = 5
+
+    /** True once a {type:"connected"} handshake has been observed. */
+    @Volatile
+    var connected: Boolean = false
+        private set
+
+    /**
+     * Registers a frame/state listener.
+     *
+     * INACTIVE in Phase 1: storage only. No implementation performs any
+     * network I/O or starts any socket.
+     */
+    fun addListener(listener: NativeWebSocketListener) {
+        listeners.add(listener)
+    }
+
+    fun removeListener(listener: NativeWebSocketListener) {
+        listeners.remove(listener)
+    }
+
+    /**
+     * Future connect entry point. PHASE 1: no-op (returns false) so the
+     * existing Flutter/Dart signaling path is never disturbed. Real wiring
+     * arrives in a later phase.
+     */
+    fun connect(userId: String, token: String): Boolean {
+        // Intentionally does nothing in Phase 1.
+        return false
+    }
+
+    /**
+     * Future send entry point. PHASE 1: no-op (returns false).
+     */
+    fun send(type: String, payload: Map<String, String>): Boolean {
+        // Intentionally does nothing in Phase 1.
+        return false
+    }
+
+    /** Future disconnect entry point. PHASE 1: no-op. */
+    fun disconnect() {
+        // Intentionally does nothing in Phase 1.
+    }
+
+    /**
+     * Computes the next reconnect delay (milliseconds) using the same
+     * exponential scheme as CallSocket.dart:
+     *    1 << clamp(attempt, 0, 5)  (seconds)
+     * PHASE 1: exposes the formula so it is testable and stays identical to
+     * the Dart reference. Not yet used by any live connection.
+     */
+    fun recalcBackoffMs(attempt: Int): Long {
+        val shifted = attempt.coerceIn(0, RECONNECT_DELAY_MAX_SHIFT)
+        return (1L shl shifted) * 1000L
+    }
+}

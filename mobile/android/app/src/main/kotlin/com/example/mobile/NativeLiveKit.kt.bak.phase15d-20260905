@@ -1,0 +1,83 @@
+package com.example.mobile
+
+/**
+ * Native LiveKit media-transport foundation for CN CALL.
+ *
+ * PHASE 1: This class is intentionally INACTIVE. It defines the future
+ * surface that will replace LiveKitCall.dart in a later phase. It does NOT
+ * connect to any LiveKit room here and does NOT open any media.
+ *
+ * Role (from the architecture report):
+ *   - LiveKit is the PASSIVE RTP/media transport only.
+ *   - Android Telecom owns audio focus, routing and the microphone lifecycle.
+ *   - This engine must therefore never acquire audio focus, never set
+ *     MODE_IN_COMMUNICATION, and never call setSpeakerphoneOn / audio-session
+ *     configuration. Speaker/earpiece routing is delegated to Telecom.
+ */
+interface NativeLiveKitListener {
+    /** Raised when the room has connected and local media is live. */
+    fun onConnected()
+
+    /** Raised when the room disconnects (remote or network). */
+    fun onDisconnected()
+
+    /** Raised on a LiveKit/transport error. */
+    fun onError(t: Throwable)
+}
+
+enum class NewNativeLiveKitState {
+    IDLE,
+    CONNECTING,
+    CONNECTED,
+    DISCONNECTED,
+}
+
+/**
+ * Behavioural placeholder for the future native LiveKit client backed by
+ * livekit-android 2.11.0 (already on the Gradle classpath).
+ *
+ * Future contract:
+ *   - connect(url, token): join room "call-<callId>", no adaptiveStream /
+ *     dynacast (identical options to LiveKitCall.dart).
+ *   - setMicrophoneEnabled: enable/disable the local audio track.
+ *   - setSpeaker: forward to Telecom's audio route, NOT AudioManager.
+ *   - disconnect(): leave + dispose the room.
+ *   - Remote audio tracks are started on subscription.
+ *
+ * All methods are no-ops in Phase 1.
+ */
+object NativeLiveKit {
+    /** Current nominal state. */
+    @Volatile
+    var state: NewNativeLiveKitState = NewNativeLiveKitState.IDLE
+        private set
+
+    private var listener: NativeLiveKitListener? = null
+
+    fun setListener(value: NativeLiveKitListener?) {
+        listener = value
+    }
+
+    /** PHASE 1: no-op. Returns false so no media path is triggered. */
+    fun connect(url: String, token: String, callId: String): Boolean {
+        // Intentionally does nothing in Phase 1.
+        @Suppress("UNUSED_VARIABLE")
+        val routed = url
+        return false
+    }
+
+    /** PHASE 1: no-op. */
+    fun setMicrophoneEnabled(enabled: Boolean) {
+        // Intentionally does nothing in Phase 1.
+    }
+
+    /** PHASE 1: no-op. Real routing is delegated to Telecom, not AudioManager. */
+    fun setSpeaker(speaker: Boolean) {
+        // Intentionally does nothing in Phase 1.
+    }
+
+    /** PHASE 1: no-op. */
+    fun disconnect() {
+        // Intentionally does nothing in Phase 1.
+    }
+}

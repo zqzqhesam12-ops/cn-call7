@@ -14,6 +14,7 @@ class CallSession {
 
   CallSession._() {
     socket.onSessionInvalid = invalidateSession;
+    socket.onCheckOwnership = guardFlutterWsOwnership;
   }
 
   final StreamController<Map<String, dynamic>> _incomingCalls =
@@ -34,6 +35,10 @@ class CallSession {
   static const _endedCallIdsKey = 'cn_call_ended_call_ids_v2';
   static const _activeCallIdKey = 'cn_call_active_call_id';
   static const _activeCallAtKey = 'cn_call_active_call_at';
+
+  /// Phase 2: shared signaling-owner marker. Stored in FlutterSharedPreferences
+  /// (native reads the fully-qualified "flutter.cn_call_ws_owner" key).
+  static const _wsOwnerKey = 'cn_call_ws_owner';
 
   Future<bool> hasActiveCall() async {
     final prefs = await SharedPreferences.getInstance();
@@ -116,9 +121,66 @@ class CallSession {
     // استقبال رسائل المكالمات يتم الآن بواسطة RtcCallManager.
   }
 
+  /// Ownership guard. Two callers:
+  ///
+  /// 1. Installed on [CallSocket] ([onCheckOwnership]) so connect/reconnect is
+  ///    allowed only while Flutter still owns signaling.
+  /// 2. Called live by [RtcCallManager] immediately BEFORE a `call_accept`
+  ///    is sent (Phase 5): a native-managed call may have become the WS owner
+  ///    since the socket connected, and the accept must then be withheld —
+  ///    Flutter never sends `call_accept` and never tries to seize ownership.
+  ///
+  /// Returns true only when no other owner (currently "native", set by a
+  /// native-managed call) holds the socket. This is the single place Flutter
+  /// writes the owner marker.
+  Future<bool> guardFlutterWsOwnership() async {
+    final prefs = await SharedPreferences.getInstance();
+    final current = prefs.getString(_wsOwnerKey) ?? '';
+    if (current == 'native') {
+      return false;
+    }
+    if (current != 'flutter') {
+      await prefs.setString(_wsOwnerKey, 'flutter');
+    }
+    return true;
+  }
+
+  /// Phase 2: clears the Flutter owner marker (used on logout and session
+  /// invalidation so a later native-managed call can acquire ownership).
+  Future<void> releaseWsOwnership() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getString(_wsOwnerKey) == 'flutter') {
+      await prefs.remove(_wsOwnerKey);
+    }
+  }
+
+  /// Cold-start staleness repair. A freshly started Flutter isolate can hold
+  /// no live Flutter-managed call, so any lingering `flutter` WS-ownership
+  /// marker and any leftover active-call marker came from a PREVIOUS process
+  /// (crash / OS kill mid-call). Clear them BEFORE the socket reconnects so:
+  ///   - the next native acquisition is never refused
+  ///     (flutterHasManagedCall / owner=="flutter" in NativeWebSocketClient),
+  ///   - the Flutter socket stays eligible to reclaim ownership on reconnect.
+  /// Only the `flutter` marker is removed when present; a `native` marker
+  /// (an active native/managed call in flight from this same process) is left
+  /// untouched, and the active-call id is cleared only while this fresh
+  /// isolate is not itself managing a call.
+  Future<void> clearStaleStateForFreshStartup() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final active = prefs.getString(_activeCallIdKey);
+    if (active != null && active.isNotEmpty) {
+      await prefs.remove(_activeCallIdKey);
+      await prefs.remove(_activeCallAtKey);
+    }
+
+    await releaseWsOwnership();
+  }
+
   Future<void> invalidateSession() async {
     await RtcCallManager.instance.endForSession(sendSignal: false);
     socket.disconnect();
+    await releaseWsOwnership();
     userId = null;
     displayName = null;
     accessToken = null;
@@ -152,9 +214,6 @@ class CallSession {
     accessToken = token;
 
     await socket.connect(id, token);
-
-    // Telecom actions are restored explicitly by telecomBackgroundMain after
-    // the WebSocket is connected.
 
     return true;
   }
@@ -274,6 +333,7 @@ class CallSession {
     _messageSubscription = null;
     await RtcCallManager.instance.endForSession();
     socket.disconnect();
+    await releaseWsOwnership();
 
     userId = null;
     displayName = null;

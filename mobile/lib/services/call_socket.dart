@@ -18,6 +18,15 @@ class CallSocket {
   bool _ready = false;
   Future<void> Function()? onSessionInvalid;
 
+  /// Phase 2: returns true only while Flutter may hold the signaling socket.
+  /// Consulted before every connect/reconnect; when it returns false the
+  /// socket must not be opened or reopened.
+  Future<bool> Function()? onCheckOwnership;
+
+  /// Phase 2: serializes the async ownership read in [_scheduleReconnect] so
+  /// two overlapping calls can never create two reconnect timers.
+  bool _reconnectScheduling = false;
+
   /// True only after the WebSocket handshake completed.  A non-null channel
   /// merely means that a connection attempt was created; it cannot carry a
   /// call control message yet.
@@ -31,9 +40,21 @@ class CallSocket {
   Future<void> connect(String userId, String token) async {
     if (connected && _userId == userId && _token == token) return;
     if (_connecting) return _readyCompleter?.future ?? Future<void>.value();
+
+    // Phase 2.1 ownership gate: never open (or reopen) a WebSocket when
+    // Flutter does not currently own signaling. Ownership loss is terminal for
+    // this socket: close and stop reconnect (credentials are kept so a later
+    // explicit connect() can re-take ownership once it is free).
+    if (!await _mayOwnSocket()) {
+      print('SOCKET CONNECT SKIPPED: Flutter is not the WS owner');
+      _disableReconnect();
+      return;
+    }
+
     _userId = userId;
     _token = token;
     _reconnectEnabled = true;
+    _reconnectScheduling = false;
 
     _connecting = true;
     _readyCompleter = Completer<void>();
@@ -48,11 +69,36 @@ class CallSocket {
 
       // logout/reconnect may have superseded this asynchronous connection
       // attempt while it was waiting for `ready`.
-      if (generation != _connectionGeneration ||
+      final superseded = generation != _connectionGeneration ||
           !_reconnectEnabled ||
           _userId != userId ||
-          _token != token) {
+          _token != token;
+
+      if (superseded) {
         await channel.sink.close();
+        if (identical(_channel, channel)) {
+          _channel = null;
+          _ready = false;
+        }
+        if (generation == _connectionGeneration) {
+          _connecting = false;
+          _readyCompleter?.completeError(StateError('CN CALL socket superseded'));
+          _readyCompleter = null;
+        }
+        return;
+      }
+
+      // Phase 2.1: ownership may have been lost while the handshake was in
+      // flight (a native-managed call requested a handoff). Close this socket
+      // and stop reconnect permanently — the loser never re-opens a socket.
+      if (!await _mayOwnSocket()) {
+        print('SOCKET CONNECT INTERRUPTED: Flutter lost WS ownership');
+        await channel.sink.close();
+        if (identical(_channel, channel)) {
+          _channel = null;
+          _ready = false;
+        }
+        _disableReconnect();
         return;
       }
 
@@ -96,7 +142,7 @@ class CallSocket {
           if (identical(_channel, channel)) {
             _channel = null;
             _ready = false;
-            if (_reconnectEnabled) _scheduleReconnect();
+            if (_reconnectEnabled) unawaited(_scheduleReconnect());
           }
         },
         onError: (error, stackTrace) {
@@ -105,7 +151,7 @@ class CallSocket {
           if (identical(_channel, channel)) {
             _channel = null;
             _ready = false;
-            if (_reconnectEnabled) _scheduleReconnect();
+            if (_reconnectEnabled) unawaited(_scheduleReconnect());
           }
         },
         cancelOnError: false,
@@ -124,14 +170,22 @@ class CallSocket {
         _connecting = false;
         _readyCompleter?.completeError(e);
         _readyCompleter = null;
-        if (_reconnectEnabled) _scheduleReconnect();
+        if (_reconnectEnabled) unawaited(_scheduleReconnect());
       }
 
       rethrow;
     }
   }
 
-  void _scheduleReconnect() {
+  /// Phase 2: consults the ownership guard when one is installed. A null guard
+  /// means ownership decisions are not enforced (legacy behavior).
+  Future<bool> _mayOwnSocket() {
+    final check = onCheckOwnership;
+    if (check == null) return Future<bool>.value(true);
+    return check();
+  }
+
+  Future<void> _scheduleReconnect() async {
     final userId = _userId;
     final token = _token;
     if (!_reconnectEnabled ||
@@ -139,9 +193,27 @@ class CallSocket {
         userId.isEmpty ||
         token == null ||
         token.isEmpty ||
+        _reconnectScheduling ||
         _reconnectTimer != null) {
       return;
     }
+
+    _reconnectScheduling = true;
+    try {
+      // Phase 2: reconnect only while Flutter still owns signaling. If
+      // ownership was lost, disable reconnect entirely so the loser never
+      // re-opens a socket and evicts the current owner.
+      if (!await _mayOwnSocket()) {
+        print('SOCKET RECONNECT SKIPPED: Flutter lost WS ownership');
+        _reconnectScheduling = false;
+        _disableReconnect();
+        return;
+      }
+    } catch (_) {
+      _reconnectScheduling = false;
+      return;
+    }
+    _reconnectScheduling = false;
 
     final delaySeconds = 1 << (_reconnectAttempt.clamp(0, 5));
     _reconnectAttempt++;
@@ -151,7 +223,7 @@ class CallSocket {
       try {
         await connect(userId, token);
       } catch (_) {
-        _scheduleReconnect();
+        unawaited(_scheduleReconnect());
       }
     });
   }
@@ -183,6 +255,7 @@ class CallSocket {
     _readyCompleter?.complete();
     _readyCompleter = null;
     _reconnectEnabled = false;
+    _reconnectScheduling = false;
     _userId = null;
     _token = null;
     _reconnectTimer?.cancel();
@@ -190,6 +263,25 @@ class CallSocket {
     _channel?.sink.close();
     _channel = null;
     _ready = false;
+  }
+
+  /// Phase 2.1: terminal stop for ownership loss. Closes the channel and
+  /// disables reconnect, but keeps [_userId]/[_token] so a later explicit
+  /// connect() can re-establish Flutter ownership once the marker is freed
+  /// (at native call teardown) without requiring a full re-login.
+  void _disableReconnect() {
+    _connectionGeneration++;
+    _connecting = false;
+    _readyCompleter?.complete();
+    _readyCompleter = null;
+    _reconnectEnabled = false;
+    _reconnectScheduling = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    final channel = _channel;
+    _channel = null;
+    _ready = false;
+    channel?.sink.close();
   }
 
   Future<void> dispose() async {
@@ -209,6 +301,7 @@ class CallSocket {
   void _handleSessionInvalid() {
     _connectionGeneration++;
     _reconnectEnabled = false;
+    _reconnectScheduling = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _connecting = false;
